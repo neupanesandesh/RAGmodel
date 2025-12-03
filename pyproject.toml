@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embedding-service"
+version = "1.0.0"
+description = "Production-grade RAG embedding service using Gemini and Qdrant"
+readme = "SETUP.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["rag", "embeddings", "gemini", "qdrant", "vector-database", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+]
+
+# Dependencies from requirements.txt
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.32.0",
+    "pydantic==2.9.2",
+    "pydantic-settings==2.6.0",
+    "python-dotenv==1.0.1",
+    "google-genai==0.3.0",
+    "numpy==1.26.4",
+    "qdrant-client==1.11.3",
+    "requests==2.32.3",
+]
+
+[project.optional-dependencies]
+# Development dependencies
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+# Console script to run the service
+# Usage: embedding-service (instead of long uvicorn command)
+embedding-service = "service.main:run_service"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/ragmodel"
+Documentation = "https://github.com/yourusername/ragmodel/blob/main/SETUP.md"
+Repository = "https://github.com/yourusername/ragmodel"
+
+[tool.setuptools]
+# Tell setuptools which packages to include
+packages = ["client", "service", "service.core"]
+
+[tool.setuptools.package-data]
+# Include non-Python files in packages
+service = ["*.env.example"]
+
+# Black configuration (optional, for code formatting)
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+# Pytest configuration
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"

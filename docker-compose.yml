@@ -16,12 +16,12 @@ services:
       - embedding-network
 
   # Embedding Service
+  # Base configuration - common settings for both dev and prod
   embedding-service:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: embedding-service
-    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:

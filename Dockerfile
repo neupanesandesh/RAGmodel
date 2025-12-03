@@ -8,22 +8,19 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy pyproject.toml first for better Docker layer caching
+# If dependencies don't change, pip install layer is cached
+COPY pyproject.toml /app/
+
 # Copy application code
+# Note: We need code present for pip install . to work
 COPY service/ /app/service/
 COPY client/ /app/client/
-COPY requirements.txt /app/
 
-# Install Python packages with retry logic for network issues
-# Install packages one by one to avoid SSL timeout on large downloads
-RUN pip install --no-cache-dir fastapi==0.115.0 && \
-    pip install --no-cache-dir uvicorn[standard]==0.32.0 && \
-    pip install --no-cache-dir pydantic==2.9.2 && \
-    pip install --no-cache-dir pydantic-settings==2.6.0 && \
-    pip install --no-cache-dir python-dotenv==1.0.1 && \
-    pip install --no-cache-dir google-genai==0.3.0 && \
-    pip install --no-cache-dir numpy==1.26.4 && \
-    pip install --no-cache-dir qdrant-client==1.11.3 && \
-    pip install --no-cache-dir requests==2.32.3
+# Install the package in production mode (not editable)
+# This installs all dependencies from pyproject.toml and makes the package importable
+# --no-cache-dir: Don't store pip cache (reduces image size)
+RUN pip install --no-cache-dir .
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && \

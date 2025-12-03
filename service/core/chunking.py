@@ -108,35 +108,35 @@ def chunk_text(text: str) -> List[Tuple[str, int]]:
 #     return estimate_tokens(text) <= max_tokens
 
 
-# if __name__ == "__main__"
-    # Test with different text sizes
-    
-    # # Small text
-    # small = "This is a short piece of text that should stay as one chunk."
-    # print(f"Small text ({estimate_tokens(small)} tokens):")
-    # print(f"  Chunks: {len(chunk_text(small))}\n")
-    
-    # # Medium text - Make it actually medium sized (500-1500 tokens)
-    # medium_paragraph = """
-    # This is a substantial paragraph of a medium-length document. It contains detailed information
-    # about various topics including technology, science, and methodology. The paragraph explores
-    # different concepts and provides comprehensive explanations that help readers understand
-    # the subject matter thoroughly. We discuss implementation details, theoretical frameworks,
-    # and practical applications that are relevant to the domain.
-    # """
-    
-    # medium = (medium_paragraph + "\n\n") * 15  # Repeat to get ~700 tokens
-    # print(f"Medium text ({estimate_tokens(medium)} tokens):")
-    # chunks = chunk_text(medium)
-    # print(f"  Chunks: {len(chunks)}")
-    # for i, (chunk, idx) in enumerate(chunks):  # Show all chunks
-    #     print(f"  Chunk {idx}: {estimate_tokens(chunk)} tokens")
-    # print()
-    
-    # # Large text - Keep the same
-    # large = "This is a very long document. " * 300
-    # print(f"Large text ({estimate_tokens(large)} tokens):")
-    # chunks = chunk_text(large)
-    # print(f"  Chunks: {len(chunks)}")
-    # for i, (chunk, idx) in enumerate(chunks[:3]):  # Show first 3
-    #     print(f"  Chunk {idx}: {estimate_tokens(chunk)} tokens")
+# if __name__ == "__main__":
+#     # Test with different text sizes
+#
+#     # Small text
+#     small = "This is a short piece of text that should stay as one chunk."
+#     print(f"Small text ({estimate_tokens(small)} tokens):")
+#     print(f"  Chunks: {len(chunk_text(small))}\n")
+#
+#     # Medium text - Make it actually medium sized (500-1500 tokens)
+#     medium_paragraph = """
+#     This is a substantial paragraph of a medium-length document. It contains detailed information
+#     about various topics including technology, science, and methodology. The paragraph explores
+#     different concepts and provides comprehensive explanations that help readers understand
+#     the subject matter thoroughly. We discuss implementation details, theoretical frameworks,
+#     and practical applications that are relevant to the domain.
+#     """
+#
+#     medium = (medium_paragraph + "\n\n") * 15  # Repeat to get ~700 tokens
+#     print(f"Medium text ({estimate_tokens(medium)} tokens):")
+#     chunks = chunk_text(medium)
+#     print(f"  Chunks: {len(chunks)}")
+#     for i, (chunk, idx) in enumerate(chunks):  # Show all chunks
+#         print(f"  Chunk {idx}: {estimate_tokens(chunk)} tokens")
+#     print()
+#
+#     # Large text - Keep the same
+#     large = "This is a very long document. " * 300
+#     print(f"Large text ({estimate_tokens(large)} tokens):")
+#     chunks = chunk_text(large)
+#     print(f"  Chunks: {len(chunks)}")
+#     for i, (chunk, idx) in enumerate(chunks[:3]):  # Show first 3
+#         print(f"  Chunk {idx}: {estimate_tokens(chunk)} tokens")

@@ -1,0 +1,53 @@
+# ========================================
+# PRODUCTION CONFIGURATION
+# ========================================
+#
+# This file adds production-specific settings on top of docker-compose.yml
+#
+# Usage (on your Linode VPS):
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Or create an alias:
+#   alias dcprod="docker-compose -f docker-compose.yml -f docker-compose.prod.yml"
+#   Then use: dcprod up -d --build
+#
+# ========================================
+
+services:
+  embedding-service:
+    # ─────────────────────────────────────
+    # AUTO-RESTART ON FAILURE
+    # ─────────────────────────────────────
+    # In production, if the container crashes, Docker will automatically
+    # restart it. This ensures high availability.
+    restart: unless-stopped
+
+    # ─────────────────────────────────────
+    # NO VOLUME MOUNTING
+    # ─────────────────────────────────────
+    # In production, code is baked into the Docker image at build time
+    # No volumes = more secure, no accidental code changes
+    # volumes: []  # Explicitly empty (not needed, just for clarity)
+
+    # ─────────────────────────────────────
+    # PRODUCTION-OPTIMIZED COMMAND
+    # ─────────────────────────────────────
+    # NO --reload flag = faster, more stable
+    # Uses the default CMD from Dockerfile which is already optimized
+    # (You don't need to specify command here, Dockerfile handles it)
+
+    # ─────────────────────────────────────
+    # BUILD SETTINGS
+    # ─────────────────────────────────────
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # In production, always rebuild to get latest code
+      # use: docker-compose -f ... -f ... up -d --build
+
+  # ─────────────────────────────────────
+  # QDRANT - PRODUCTION SETTINGS
+  # ─────────────────────────────────────
+  qdrant:
+    # Ensure Qdrant also restarts automatically
+    restart: unless-stopped

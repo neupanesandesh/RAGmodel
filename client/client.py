@@ -112,24 +112,25 @@ class EmbeddingClient:
     
     # Collection Operations
     
-    def create_collection(self, name: str, vector_size: int = 768) -> dict:
+    def create_collection(self, name: str) -> dict:
         """
         Create a new collection for storing documents.
-        
+
+        Vector size is automatically set based on server configuration.
+
         Args:
             name: Collection name
-            vector_size: Vector dimension (default: 768, recommended for cost)
-        
+
         Returns:
             Success message
-            
+
         Example:
             >>> client.create_collection("customer_support")
         """
         return self._make_request(
             "POST",
             "/collections",
-            json_data={"name": name, "vector_size": vector_size}
+            json_data={"name": name}
         )
     
     def list_collections(self) -> List[str]:

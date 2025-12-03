@@ -7,34 +7,18 @@ Main application that exposes REST API endpoints for embedding operations.
 from fastapi import FastAPI, HTTPException, status, File, UploadFile, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from service.config import settings, validate_settings
+from service.models import (
+    CollectionCreate, CollectionResponse, CollectionList,
+    DocumentAdd, DocumentAddResponse,
+    DocumentDelete, DocumentDeleteResponse,
+    SearchRequest, SearchResponse, SearchResult, SearchResultMetadata,
+    HealthResponse, ErrorResponse
+)
+from service.core.chunking import chunk_text
+from service.core.embedder import GeminiEmbedder
+from service.core.vectorstore import QdrantStore
 
-# Handle imports for both installed package and local development
-try:
-    # Try installed package imports first
-    from service.config import settings, validate_settings
-    from service.models import (
-        CollectionCreate, CollectionResponse, CollectionList,
-        DocumentAdd, DocumentAddResponse,
-        DocumentDelete, DocumentDeleteResponse,
-        SearchRequest, SearchResponse, SearchResult, SearchResultMetadata,
-        HealthResponse, ErrorResponse
-    )
-    from service.core.chunking import chunk_text
-    from service.core.embedder import GeminiEmbedder
-    from service.core.vectorstore import QdrantStore
-except ImportError:
-    # Fall back to relative imports for local development
-    from .config import settings, validate_settings
-    from .models import (
-        CollectionCreate, CollectionResponse, CollectionList,
-        DocumentAdd, DocumentAddResponse,
-        DocumentDelete, DocumentDeleteResponse,
-        SearchRequest, SearchResponse, SearchResult, SearchResultMetadata,
-        HealthResponse, ErrorResponse
-    )
-    from .core.chunking import chunk_text
-    from .core.embedder import GeminiEmbedder
-    from .core.vectorstore import QdrantStore 
 
 
 # Global instances (initialized on startup)
@@ -122,12 +106,12 @@ async def create_collection(request: CollectionCreate):
     try:
         vector_store.create_collection(
             collection_name=request.name,
-            # vector_size=request.vector_size
+            vector_size=settings.embedding_dimension
         )
         return {
             "message": f"Collection '{request.name}' created successfully",
             "name": request.name,
-            # "vector_size": request.vector_size
+            "vector_size": settings.embedding_dimension
         }
     except Exception as e:
         raise HTTPException(
@@ -214,7 +198,7 @@ async def add_document_raw_text(
             )
 
         # Step 2: Embed all chunks
-        chunk_texts = [chunk_text for chunk_text, _ in chunks]
+        chunk_texts = [text for text, _ in chunks]
         embeddings = embedder.embed_batch(chunk_texts, task_type="RETRIEVAL_DOCUMENT")
 
         # Step 3: Store in Qdrant
