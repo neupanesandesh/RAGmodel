@@ -33,6 +33,7 @@ dependencies = [
     "numpy==1.26.4",
     "qdrant-client==1.11.3",
     "requests==2.32.3",
+    "loguru==0.7.2",
 ]
 
 [project.optional-dependencies]

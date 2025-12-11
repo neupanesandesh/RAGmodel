@@ -36,6 +36,15 @@ services:
       # Service Configuration
       - SERVICE_HOST=0.0.0.0
       - SERVICE_PORT=8000
+
+      # Logging Configuration
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=/app/logs
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
+      - LOG_ROTATION_SIZE=${LOG_ROTATION_SIZE:-100 MB}
+    volumes:
+      - embedding_logs:/app/logs
     depends_on:
       - qdrant
     networks:
@@ -49,6 +58,8 @@ services:
 
 volumes:
   qdrant_storage:
+    driver: local
+  embedding_logs:
     driver: local
 
 networks:

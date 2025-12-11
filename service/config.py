@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
 
+    # Logging Configuration
+    environment: str = os.getenv("ENVIRONMENT", "development")
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    log_dir: str = os.getenv("LOG_DIR", "./logs")
+    log_retention_days: int = int(os.getenv("LOG_RETENTION_DAYS", "30"))
+    log_rotation_size: str = os.getenv("LOG_ROTATION_SIZE", "100 MB")
+
     class Config:
         env_file = ".env"
         case_sensitive = False

@@ -283,12 +283,27 @@ QDRANT_URL=http://localhost:6333  # Dev: localhost, Prod: use service name
 # Service Settings
 SERVICE_HOST=0.0.0.0
 SERVICE_PORT=8000
+
+# Logging Configuration
+ENVIRONMENT=development              # development | production
+LOG_LEVEL=INFO                      # TRACE | DEBUG | INFO | WARNING | ERROR | CRITICAL
+LOG_DIR=./logs                      # Directory for log files
+LOG_RETENTION_DAYS=30               # Days to keep old logs
+LOG_ROTATION_SIZE=100 MB            # Size before rotation (100 MB, 500 MB, 1 GB, etc.)
 ```
 
 **Embedding Dimensions:**
 - `768` - Fast, cost-effective (recommended)
 - `1536` - Balanced
 - `3072` - Maximum quality
+
+**Log Levels:**
+- `TRACE` - Ultra-verbose, every operation
+- `DEBUG` - Detailed debugging info (dev recommended)
+- `INFO` - General informational messages (prod recommended)
+- `WARNING` - Warning messages and above
+- `ERROR` - Error messages only
+- `CRITICAL` - Critical errors only
 
 ---
 
@@ -390,6 +405,445 @@ embedding-service: # FastAPI application (port 8000)
 6. Set healthcheck
 7. Expose port 8000
 8. Run: uvicorn service.main:app
+```
+
+---
+
+## 📊 Logging & Monitoring
+
+The service uses **Loguru** for comprehensive, production-ready logging. Logs are automatically categorized and rotated for easy monitoring on your Linode VPS.
+
+### **Log Files Overview**
+
+All logs are stored in the configured `LOG_DIR` (default: `./logs` or `/app/logs` in Docker):
+
+| File | Content | Use Case |
+|------|---------|----------|
+| `app.log` | All application logs | General debugging and monitoring |
+| `error.log` | Warnings, errors, and critical issues | Quick error checking |
+| `requests.log` | HTTP requests/responses with timing | API usage monitoring |
+| `performance.log` | Performance metrics (embeddings, searches) | Performance analysis |
+| `app.json` | JSON-formatted logs (production only) | Log aggregation tools (ELK, Datadog) |
+
+**Automatic Management:**
+- **Rotation:** Files rotate when they reach `LOG_ROTATION_SIZE` (default: 100 MB)
+- **Compression:** Old logs are automatically compressed to `.zip`
+- **Retention:** Logs older than `LOG_RETENTION_DAYS` (default: 30) are deleted
+- **Thread-safe:** Safe for async operations and multiple workers
+
+---
+
+### **Development vs Production Logging**
+
+#### **Development Mode** (`ENVIRONMENT=development`)
+
+**Console Output:**
+```
+2025-12-07 10:30:15 | INFO     | main:lifespan:54 | Starting Embedding Service
+2025-12-07 10:30:16 | SUCCESS  | main:lifespan:66 | Gemini embedder initialized
+2025-12-07 10:30:16 | SUCCESS  | main:lifespan:75 | Qdrant vector store connected
+2025-12-07 10:30:17 | INFO     | request:log_requests:121 | POST /collections/docs/documents/text
+2025-12-07 10:30:17 | INFO     | performance:add_document:262 | Document added: doc123
+```
+
+**Features:**
+- ✅ **Colored output** - Easy to read in terminal (green=success, red=error, etc.)
+- ✅ **DEBUG level** - Shows detailed debugging information
+- ✅ **Full diagnostics** - Variable values shown in exceptions
+- ✅ **File + line numbers** - Exact code location for each log
+- ✅ **Human-readable** - Formatted for developers
+
+**What you see:**
+```bash
+# Terminal shows colored logs
+./dev.sh logs -f
+
+# Log files created in ./logs/
+ls -lh logs/
+```
+
+---
+
+#### **Production Mode** (`ENVIRONMENT=production`)
+
+**Console Output (JSON):**
+```json
+{"text": "Starting Embedding Service", "record": {"time": {"timestamp": 1733574615.123}, "level": {"name": "INFO"}}, "message": "Starting Embedding Service", "extra": {"environment": "production"}}
+{"text": "Gemini embedder initialized", "record": {"time": {"timestamp": 1733574616.456}, "level": {"name": "SUCCESS"}}, "extra": {"model": "models/gemini-embedding-001", "dimensions": 768}}
+{"text": "POST /collections/docs/documents/text - 201", "record": {"level": {"name": "INFO"}}, "extra": {"method": "POST", "status_code": 201, "process_time_ms": 234.56}}
+```
+
+**Features:**
+- ✅ **JSON format** - Easy parsing for log aggregation tools
+- ✅ **INFO level** - Less verbose, production-appropriate
+- ✅ **No variable exposure** - Security-focused (no `diagnose=True`)
+- ✅ **Structured data** - Machine-readable, perfect for analysis
+- ✅ **Log aggregation ready** - Works with ELK, Datadog, Grafana Loki
+
+**What you see:**
+```bash
+# Docker logs show JSON
+./prod.sh logs -f
+
+# Log files created in Docker volume
+docker exec embedding-service ls -lh /app/logs/
+```
+
+---
+
+### **Accessing Logs**
+
+#### **Development (Local)**
+
+```bash
+# View all logs in terminal
+./dev.sh logs -f
+
+# View specific service
+./dev.sh logs -f embedding-service
+
+# Access log files directly
+tail -f logs/app.log
+tail -f logs/error.log
+tail -f logs/requests.log
+tail -f logs/performance.log
+
+# Search for errors
+grep "ERROR" logs/app.log
+grep "Failed" logs/error.log
+```
+
+#### **Production (Linode VPS)**
+
+```bash
+# Real-time Docker logs
+./prod.sh logs -f
+
+# View logs inside container
+docker exec embedding-service tail -f /app/logs/app.log
+docker exec embedding-service tail -f /app/logs/error.log
+docker exec embedding-service tail -f /app/logs/requests.log
+docker exec embedding-service tail -f /app/logs/performance.log
+
+# Copy logs from container to host
+docker cp embedding-service:/app/logs ./local-logs
+
+# List all log files with sizes
+docker exec embedding-service ls -lh /app/logs/
+
+# Search for specific patterns
+docker exec embedding-service grep "ERROR" /app/logs/error.log
+docker exec embedding-service grep "timing" /app/logs/performance.log
+
+# View compressed old logs
+docker exec embedding-service ls -lh /app/logs/*.zip
+```
+
+#### **Production Log Volume**
+
+Logs are stored in a persistent Docker volume (`embedding_logs`):
+
+```bash
+# Inspect volume
+docker volume inspect ragmodel_embedding_logs
+
+# Find volume location on host
+docker volume inspect ragmodel_embedding_logs --format '{{.Mountpoint}}'
+
+# Access volume directly (root required)
+sudo ls -lh /var/lib/docker/volumes/ragmodel_embedding_logs/_data/
+```
+
+**Benefits:**
+- Logs persist even if container is removed
+- Can be backed up separately
+- Survives `docker-compose down` (NOT `docker-compose down -v`)
+
+---
+
+### **Log Categories Explained**
+
+#### **1. Application Logs** (`app.log`)
+
+Everything that happens in the service:
+```
+2025-12-07 10:30:15 | INFO     | Starting Embedding Service
+2025-12-07 10:30:16 | SUCCESS  | Configuration validated successfully
+2025-12-07 10:30:16 | SUCCESS  | Gemini embedder initialized
+2025-12-07 10:30:17 | INFO     | Collection created: docs
+2025-12-07 10:30:18 | SUCCESS  | Document added to docs: doc123 (5 chunks)
+```
+
+**Use for:** General service monitoring, understanding flow
+
+---
+
+#### **2. Error Logs** (`error.log`)
+
+Only warnings and above:
+```
+2025-12-07 10:35:22 | WARNING  | Collection deleted: old_docs
+2025-12-07 10:40:15 | ERROR    | Failed to create collection: docs
+  → collection_name: docs
+  → error: Collection 'docs' already exists
+2025-12-07 10:45:30 | ERROR    | Search failed in nonexistent_collection
+```
+
+**Use for:** Quick error checking, alerting, troubleshooting
+
+---
+
+#### **3. Request Logs** (`requests.log`)
+
+Every HTTP request/response:
+```
+2025-12-07 10:30:17 | INFO     | POST /collections/docs/documents/text
+  → method: POST
+  → path: /collections/docs/documents/text
+  → query_params: doc_id=doc123
+  → client_ip: 172.18.0.1
+  → user_agent: python-requests/2.32.3
+2025-12-07 10:30:17 | INFO     | POST /collections/docs/documents/text - 201
+  → method: POST
+  → path: /collections/docs/documents/text
+  → status_code: 201
+  → process_time_ms: 234.56
+```
+
+**Use for:** API usage monitoring, performance tracking, debugging client issues
+
+---
+
+#### **4. Performance Logs** (`performance.log`)
+
+Detailed performance metrics:
+```
+2025-12-07 10:30:17 | INFO     | Document added: doc123
+  → operation: add_document
+  → doc_id: doc123
+  → collection: docs
+  → chunks_count: 5
+  → text_length: 2548
+  → timing:
+    - total_ms: 234.56
+    - chunking_ms: 12.34
+    - embedding_ms: 180.45
+    - storage_ms: 41.77
+
+2025-12-07 10:30:20 | INFO     | Search completed: "machine learning algorithms"
+  → operation: search
+  → collection: docs
+  → query_length: 28
+  → k: 10
+  → results_count: 10
+  → timing:
+    - total_ms: 156.78
+    - embedding_ms: 120.45
+    - search_ms: 36.33
+```
+
+**Use for:** Performance analysis, optimization, cost tracking (Gemini API usage)
+
+---
+
+#### **5. JSON Logs** (`app.json` - Production Only)
+
+Machine-readable structured logs:
+```json
+{"text": "Document added: doc123", "record": {"time": {"timestamp": 1733574617.234}}, "extra": {"operation": "add_document", "chunks_count": 5, "timing": {"total_ms": 234.56}}}
+```
+
+**Use for:** Log aggregation services, automated monitoring, analytics
+
+---
+
+### **Production Monitoring Setup**
+
+#### **Basic Monitoring (SSH + Commands)**
+
+```bash
+# SSH into your Linode VPS
+ssh root@your-server-ip
+
+# Watch for errors
+watch -n 5 'docker exec embedding-service tail -n 20 /app/logs/error.log'
+
+# Monitor performance
+docker exec embedding-service tail -f /app/logs/performance.log
+
+# Check request volume
+docker exec embedding-service wc -l /app/logs/requests.log
+```
+
+#### **Advanced Monitoring (Log Aggregation)**
+
+**Option 1: ELK Stack (Elasticsearch, Logstash, Kibana)**
+```bash
+# Ship app.json to Elasticsearch
+# Visualize in Kibana dashboards
+# Set up alerts on error rates
+```
+
+**Option 2: Grafana Loki + Promtail**
+```bash
+# Lightweight alternative to ELK
+# Integrates with Grafana
+# Query logs like you query metrics
+```
+
+**Option 3: Cloud Services**
+- **Datadog** - Full observability platform
+- **New Relic** - APM + logging
+- **Papertrail** - Simple log aggregation
+
+#### **Setting Up Alerts**
+
+```bash
+# Simple script to check error count
+#!/bin/bash
+ERROR_COUNT=$(docker exec embedding-service grep "ERROR" /app/logs/error.log | wc -l)
+if [ $ERROR_COUNT -gt 10 ]; then
+    echo "High error count: $ERROR_COUNT" | mail -s "Alert" admin@example.com
+fi
+
+# Run via cron every 5 minutes
+*/5 * * * * /path/to/check_errors.sh
+```
+
+---
+
+### **Customizing Logging**
+
+#### **Change Log Level**
+
+```bash
+# Development - more verbose
+LOG_LEVEL=DEBUG ./dev.sh up
+
+# Production - less verbose
+LOG_LEVEL=WARNING ./prod.sh up -d
+```
+
+#### **Change Rotation Size**
+
+```bash
+# Rotate at 500 MB instead of 100 MB
+LOG_ROTATION_SIZE=500 MB
+
+# Rotate at 1 GB
+LOG_ROTATION_SIZE=1 GB
+```
+
+#### **Change Retention Period**
+
+```bash
+# Keep logs for 60 days instead of 30
+LOG_RETENTION_DAYS=60
+
+# Keep logs for 7 days (save disk space)
+LOG_RETENTION_DAYS=7
+```
+
+#### **Change Log Directory**
+
+```bash
+# Local development
+LOG_DIR=/var/log/ragmodel
+
+# Docker (requires volume update)
+LOG_DIR=/app/logs  # Already configured
+```
+
+---
+
+### **Log File Rotation Example**
+
+```
+/app/logs/
+├── app.log                    # Current log (85 MB)
+├── app.log.2025-12-06.zip    # Rotated log from yesterday (12 MB compressed)
+├── app.log.2025-12-05.zip    # Rotated log from 2 days ago (11 MB compressed)
+├── error.log                  # Current error log (5 MB)
+├── requests.log               # Current request log (50 MB)
+├── performance.log            # Current performance log (30 MB)
+└── app.json                   # Current JSON log (85 MB)
+```
+
+**When `app.log` reaches 100 MB:**
+1. Compressed to `app.log.2025-12-07.zip`
+2. New `app.log` created
+3. Old logs beyond 30 days deleted automatically
+
+---
+
+### **Understanding Log Entries**
+
+#### **Success Entry (Development)**
+```
+2025-12-07 10:30:16 | SUCCESS  | embedder:__init__:33 | GeminiEmbedder initialized
+  └─ Date/Time         Level      Component:Function     Message
+```
+
+#### **Performance Entry (Production JSON)**
+```json
+{
+  "text": "Document added: doc123",
+  "record": {
+    "time": {"timestamp": 1733574617.234},
+    "level": {"name": "INFO"}
+  },
+  "extra": {
+    "operation": "add_document",
+    "doc_id": "doc123",
+    "collection": "docs",
+    "chunks_count": 5,
+    "timing": {
+      "total_ms": 234.56,
+      "chunking_ms": 12.34,
+      "embedding_ms": 180.45,
+      "storage_ms": 41.77
+    }
+  }
+}
+```
+
+---
+
+### **Troubleshooting Logging Issues**
+
+#### **No logs appearing**
+```bash
+# Check if logging is configured
+docker exec embedding-service env | grep LOG
+
+# Check if log directory exists
+docker exec embedding-service ls -la /app/logs/
+
+# Check log configuration in code
+docker exec embedding-service cat /app/service/config.py | grep -A 5 "Logging"
+```
+
+#### **Logs not rotating**
+```bash
+# Check current log sizes
+docker exec embedding-service du -h /app/logs/
+
+# Verify rotation settings
+docker exec embedding-service env | grep LOG_ROTATION
+```
+
+#### **Can't access log volume**
+```bash
+# Check if volume exists
+docker volume ls | grep embedding_logs
+
+# Inspect volume
+docker volume inspect ragmodel_embedding_logs
+
+# Recreate volume if needed
+./prod.sh down
+docker volume rm ragmodel_embedding_logs
+./prod.sh up -d --build
 ```
 
 ---
@@ -501,23 +955,35 @@ RAGmodel/
 │   ├── __init__.py
 │   └── client.py
 ├── service/             # FastAPI backend
-│   ├── main.py         # API endpoints
-│   ├── config.py       # Configuration
-│   ├── models.py       # Pydantic models
+│   ├── main.py              # API endpoints + request logging
+│   ├── config.py            # Configuration + logging settings
+│   ├── logging_config.py    # Loguru logging setup
+│   ├── models.py            # Pydantic models
 │   └── core/
-│       ├── embedder.py      # Gemini embeddings
-│       ├── vectorstore.py   # Qdrant operations
-│       └── chunking.py      # Text chunking
+│       ├── embedder.py      # Gemini embeddings (with logging)
+│       ├── vectorstore.py   # Qdrant operations (with logging)
+│       └── chunking.py      # Text chunking (with logging)
+├── tests/                    # Unit tests
+│   ├── conftest.py          # Test fixtures
+│   ├── test_chunking.py     # Chunking tests
+│   └── test_config.py       # Config tests
+├── logs/                     # Log files (auto-created, git-ignored)
+│   ├── app.log              # All application logs
+│   ├── error.log            # Errors and warnings only
+│   ├── requests.log         # HTTP requests/responses
+│   ├── performance.log      # Performance metrics
+│   └── app.json             # JSON logs (production)
 ├── docker-compose.yml        # Base Docker config
 ├── docker-compose.dev.yml    # Dev overrides
 ├── docker-compose.prod.yml   # Prod overrides
 ├── Dockerfile               # Container image
 ├── pyproject.toml          # Package configuration
-├── requirements.txt        # Dependencies (legacy)
+├── requirements.txt        # Dependencies
 ├── dev.sh                 # Dev convenience script
 ├── prod.sh                # Prod convenience script
 ├── .env.example          # Environment template
-└── .env                  # Your config (git-ignored)
+├── .env                  # Your config (git-ignored)
+└── SETUP.md              # This file
 ```
 
 ---

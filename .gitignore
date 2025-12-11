@@ -70,6 +70,11 @@ venv.bak/
 # Docker
 *.log
 
+# Logging (Loguru)
+logs/
+*.log
+*.zip
+
 # Qdrant data
 qdrant_storage/
 

@@ -37,6 +37,18 @@ services:
     # (You don't need to specify command here, Dockerfile handles it)
 
     # ─────────────────────────────────────
+    # PRODUCTION LOGGING
+    # ─────────────────────────────────────
+    # Override logging settings for production
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+    # Keep log volume for production monitoring
+    volumes:
+      - embedding_logs:/app/logs
+
+    # ─────────────────────────────────────
     # BUILD SETTINGS
     # ─────────────────────────────────────
     build:

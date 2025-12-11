@@ -14,3 +14,6 @@ qdrant-client==1.11.3
 
 # Client Library Dependencies
 requests==2.32.3
+
+# Logging
+loguru==0.7.2

@@ -25,6 +25,15 @@ services:
       - ./service:/app/service        # FastAPI application code
       - ./client:/app/client          # Client library code
       - ./pyproject.toml:/app/pyproject.toml  # Package configuration
+      - embedding_logs:/app/logs      # Log files (persistent)
+
+    # ─────────────────────────────────────
+    # DEVELOPMENT LOGGING
+    # ─────────────────────────────────────
+    # Ensure development environment is set
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
 
     # ─────────────────────────────────────
     # HOT-RELOAD ENABLED WITH EDITABLE INSTALL

@@ -1,5 +1,9 @@
 from typing import List, Tuple
 import re
+from service.logging_config import get_component_logger
+
+# Initialize logger for chunking module
+logger = get_component_logger("chunking")
 
 def estimate_tokens(text: str) -> int:
     word_count = len(text.split())
@@ -39,15 +43,22 @@ def chunk_text(text: str) -> List[Tuple[str, int]]:
     # Clean the input text
     text = text.strip()
     if not text:
+        logger.warning("Empty text provided for chunking")
         return []
-    
+
     # Estimate total tokens
     total_tokens = estimate_tokens(text)
-    
+
+    logger.debug(
+        f"Chunking text: {total_tokens} estimated tokens",
+        extra={"text_length": len(text), "estimated_tokens": total_tokens}
+    )
+
     # Strategy 1: Small text - keep as single chunk
     if total_tokens < 500:
+        logger.debug("Using strategy: single chunk (small text)")
         return [(text, 0)]
-    
+
     # Strategy 2: Medium text - split at paragraphs
     elif total_tokens < 1500:
         paragraphs = split_into_paragraphs(text)
@@ -82,9 +93,14 @@ def chunk_text(text: str) -> List[Tuple[str, int]]:
         # Add remaining chunk
         if current_chunk:
             chunks.append(' '.join(current_chunk))
-        
-        return [(chunk, idx) for idx, chunk in enumerate(chunks)]
-    
+
+        result = [(chunk, idx) for idx, chunk in enumerate(chunks)]
+        logger.debug(
+            f"Using strategy: paragraph-based (medium text) - created {len(result)} chunks",
+            extra={"chunks_count": len(result), "strategy": "paragraph"}
+        )
+        return result
+
     # Strategy 3: Large text - sliding window with overlap
     else:
         chunks = create_overlapping_chunks(
@@ -92,7 +108,12 @@ def chunk_text(text: str) -> List[Tuple[str, int]]:
             chunk_size=400,  # Target 400 tokens per chunk
             overlap=100       # 100 token overlap for continuity
         )
-        return [(chunk, idx) for idx, chunk in enumerate(chunks)]
+        result = [(chunk, idx) for idx, chunk in enumerate(chunks)]
+        logger.debug(
+            f"Using strategy: sliding window (large text) - created {len(result)} chunks",
+            extra={"chunks_count": len(result), "strategy": "sliding_window"}
+        )
+        return result
     
 # def validate_chunk_size(text: str, max_tokens: int = 2048) -> bool:
 #     """

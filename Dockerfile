@@ -22,8 +22,9 @@ COPY client/ /app/client/
 # --no-cache-dir: Don't store pip cache (reduces image size)
 RUN pip install --no-cache-dir .
 
-# Create non-root user
+# Create non-root user and logs directory with proper permissions
 RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app/logs && \
     chown -R appuser:appuser /app
 
 USER appuser
