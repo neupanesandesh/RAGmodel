@@ -17,6 +17,10 @@ from qdrant_client.models import (
     MatchValue
 )
 import uuid
+from service.logging_config import get_component_logger
+
+# Initialize logger for vectorstore module
+logger = get_component_logger("vectorstore")
 
 
 class QdrantStore:
@@ -39,6 +43,8 @@ class QdrantStore:
             self.client = QdrantClient(url=url, api_key=api_key)
         else:
             self.client = QdrantClient(url=url)
+
+        logger.debug(f"QdrantStore initialized", extra={"url": url, "has_api_key": bool(api_key)})
     
     def create_collection(self, collection_name: str, vector_size: int = 768) -> bool:
         """
@@ -58,8 +64,17 @@ class QdrantStore:
             # Check if collection already exists
             collections = self.client.get_collections().collections
             if any(c.name == collection_name for c in collections):
+                logger.warning(
+                    f"Collection already exists: {collection_name}",
+                    extra={"collection_name": collection_name}
+                )
                 raise Exception(f"Collection '{collection_name}' already exists")
-            
+
+            logger.info(
+                f"Creating collection: {collection_name}",
+                extra={"collection_name": collection_name, "vector_size": vector_size}
+            )
+
             # Create collection with cosine distance metric
             # Cosine is ideal for normalized embeddings (measures angle, not magnitude)
             self.client.create_collection(
@@ -69,9 +84,18 @@ class QdrantStore:
                     distance=Distance.COSINE
                 )
             )
+
+            logger.success(
+                f"Collection created successfully: {collection_name}",
+                extra={"collection_name": collection_name, "vector_size": vector_size}
+            )
             return True
-            
+
         except Exception as e:
+            logger.error(
+                f"Failed to create collection: {collection_name}",
+                extra={"collection_name": collection_name, "error": str(e)}
+            )
             raise Exception(f"Failed to create collection: {str(e)}")
     
     def delete_collection(self, collection_name: str) -> bool:
@@ -149,20 +173,30 @@ class QdrantStore:
         """
         if len(chunks) != len(embeddings):
             raise ValueError("Chunks and embeddings must have same length")
-        
+
         if not self.collection_exists(collection_name):
             raise Exception(f"Collection '{collection_name}' does not exist")
-        
+
         try:
+            logger.info(
+                f"Adding document to collection: {doc_id}",
+                extra={
+                    "collection": collection_name,
+                    "doc_id": doc_id,
+                    "chunks_count": len(chunks),
+                    "namespace": namespace
+                }
+            )
+
             # Prepare points for Qdrant
             points = []
             chunk_count = len(chunks)
             timestamp = datetime.utcnow().isoformat()
-            
+
             for (chunk_text, chunk_index), embedding in zip(chunks, embeddings):
                 # Generate unique point ID
                 point_id = str(uuid.uuid4())
-                
+
                 # Build payload with all metadata
                 payload = {
                     "doc_id": doc_id,
@@ -171,11 +205,11 @@ class QdrantStore:
                     "text": chunk_text,
                     "created_at": timestamp
                 }
-                
+
                 # Add namespace if provided
                 if namespace:
                     payload["namespace"] = namespace
-                
+
                 # Create point
                 point = PointStruct(
                     id=point_id,
@@ -183,16 +217,29 @@ class QdrantStore:
                     payload=payload
                 )
                 points.append(point)
-            
+
             # Upload to Qdrant
             self.client.upsert(
                 collection_name=collection_name,
                 points=points
             )
-            
+
+            logger.success(
+                f"Document added successfully: {doc_id}",
+                extra={
+                    "collection": collection_name,
+                    "doc_id": doc_id,
+                    "points_stored": len(points)
+                }
+            )
+
             return len(points)
-            
+
         except Exception as e:
+            logger.error(
+                f"Failed to add document: {doc_id}",
+                extra={"collection": collection_name, "doc_id": doc_id, "error": str(e)}
+            )
             raise Exception(f"Failed to add document: {str(e)}")
     
     def search(
@@ -220,8 +267,13 @@ class QdrantStore:
         """
         if not self.collection_exists(collection_name):
             raise Exception(f"Collection '{collection_name}' does not exist")
-        
+
         try:
+            logger.debug(
+                f"Searching in collection: {collection_name}",
+                extra={"collection": collection_name, "k": k, "namespace": namespace}
+            )
+
             # Build filter if namespace specified
             query_filter = None
             if namespace:
@@ -233,7 +285,7 @@ class QdrantStore:
                         )
                     ]
                 )
-            
+
             # Execute search
             results = self.client.search(
                 collection_name=collection_name,
@@ -241,7 +293,7 @@ class QdrantStore:
                 limit=k,
                 query_filter=query_filter
             )
-            
+
             # Format results for easy consumption
             formatted_results = []
             for result in results:
@@ -256,10 +308,23 @@ class QdrantStore:
                         "created_at": result.payload.get("created_at")
                     }
                 })
-            
+
+            logger.info(
+                f"Search completed in {collection_name}",
+                extra={
+                    "collection": collection_name,
+                    "results_found": len(formatted_results),
+                    "requested": k
+                }
+            )
+
             return formatted_results
-            
+
         except Exception as e:
+            logger.error(
+                f"Search failed in {collection_name}: {str(e)}",
+                extra={"collection": collection_name, "error": str(e)}
+            )
             raise Exception(f"Search failed: {str(e)}")
     
     def delete_document(self, collection_name: str, doc_id: str) -> int:
