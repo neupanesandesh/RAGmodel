@@ -17,6 +17,9 @@ COPY pyproject.toml /app/
 COPY service/ /app/service/
 COPY client/ /app/client/
 
+# Upgrade pip and install wheel first
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools
+
 # Install the package in production mode (not editable)
 # This installs all dependencies from pyproject.toml and makes the package importable
 # --no-cache-dir: Don't store pip cache (reduces image size)

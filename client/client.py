@@ -14,52 +14,73 @@ from dataclasses import dataclass
 class SearchResult:
     """
     A single search result.
-    
+
     Attributes:
         score: Similarity score (0-1, higher is better)
         text: The matched text chunk
-        doc_id: Document ID this chunk belongs to
+        dataset_id: Dataset identifier this chunk belongs to
         chunk_index: Position of this chunk in the document
-        namespace: Namespace if specified
-        metadata: Additional metadata
+        chunk_count: Total number of chunks in the document
+        created_at: Timestamp when the document was created
+        metadata: Optional user metadata (doc_type, location, etc.)
     """
     score: float
     text: str
-    doc_id: str
+    dataset_id: str
     chunk_index: int
     chunk_count: int
-    namespace: Optional[str]
     created_at: str
-    
+    metadata: Optional[Dict[str, Any]] = None
+
     @classmethod
     def from_dict(cls, data: dict):
         """Create SearchResult from API response dict."""
+        # Extract core fields that are always present
+        core_fields = {
+            "dataset_id", "chunk_index", "chunk_count", "created_at"
+        }
+
+        # Separate user metadata from core fields
+        user_metadata = {
+            k: v for k, v in data["metadata"].items()
+            if k not in core_fields and k != "text"
+        }
+
         return cls(
             score=data["score"],
             text=data["text"],
-            doc_id=data["metadata"]["doc_id"],
+            dataset_id=data["metadata"]["dataset_id"],
             chunk_index=data["metadata"]["chunk_index"],
             chunk_count=data["metadata"]["chunk_count"],
-            namespace=data["metadata"].get("namespace"),
-            created_at=data["metadata"]["created_at"]
+            created_at=data["metadata"]["created_at"],
+            metadata=user_metadata if user_metadata else None
         )
 
 
 class EmbeddingClient:
     """
     Client for the Embedding Service.
-    
+
     This is the main interface developers use to interact with your service.
-    
+
     Args:
-        service_url: URL of the embedding service (e.g., "https://your-service.com")
+        service_url: URL of the embedding service (e.g., "http://localhost:8000")
         timeout: Request timeout in seconds (default: 30)
-    
+
     Example:
-        >>> client = EmbeddingClient("https://your-service.com")
-        >>> client.create_collection("my_docs")
-        >>> client.add_document("my_docs", "doc1", "Your text here...")
-        >>> results = client.search("my_docs", "search query", k=10)
+        >>> client = EmbeddingClient("http://localhost:8000")
+        >>> client.create_collection("auditcity")
+        >>> client.add_document(
+        ...     collection="auditcity",
+        ...     dataset_id="dallas-dentist",
+        ...     text="Your text here...",
+        ...     metadata={"doc_type": "reviews"}
+        ... )
+        >>> results = client.search(
+        ...     collection="auditcity",
+        ...     dataset_id="dallas-dentist",
+        ...     query="search query"
+        ... )
     """
     
     def __init__(self, service_url: str, timeout: int = 30):
@@ -146,15 +167,35 @@ class EmbeddingClient:
     def get_collection_info(self, collection_name: str) -> dict:
         """
         Get information about a collection.
-        
+
         Args:
             collection_name: Name of the collection
-        
+
         Returns:
             Collection information (vector count, size, etc.)
         """
         return self._make_request("GET", f"/collections/{collection_name}")
-    
+
+    def list_datasets(self, collection_name: str) -> List[str]:
+        """
+        List all dataset IDs in a collection.
+
+        Useful for verifying uploads and checking what datasets exist.
+
+        Args:
+            collection_name: Name of the collection
+
+        Returns:
+            List of dataset_ids
+
+        Example:
+            >>> datasets = client.list_datasets("auditcity")
+            >>> print(datasets)
+            ['dallas-dentist', 'austin-pizza', 'houston-restaurant']
+        """
+        response = self._make_request("GET", f"/collections/{collection_name}/datasets")
+        return response["datasets"]
+
     def delete_collection(self, collection_name: str) -> dict:
         """
         Delete a collection and all its documents.
@@ -168,13 +209,13 @@ class EmbeddingClient:
         return self._make_request("DELETE", f"/collections/{collection_name}")
     
     # Document Operations
-    
+
     def add_document(
         self,
         collection: str,
-        doc_id: str,
+        dataset_id: str,
         text: str,
-        namespace: Optional[str] = None
+        metadata: Optional[Dict[str, Any]] = None
     ) -> dict:
         """
         Add a document to a collection.
@@ -183,28 +224,31 @@ class EmbeddingClient:
 
         Args:
             collection: Target collection name
-            doc_id: Unique identifier for this document
+            dataset_id: Unique dataset identifier (e.g., 'dallas-dentist', 'austin-pizza')
             text: Document text content
-            namespace: Optional namespace for grouping (e.g., "product_docs")
+            metadata: Optional metadata dict (e.g., {"doc_type": "reviews", "location": "Dallas"})
 
         Returns:
             Information about chunks stored
 
         Example:
             >>> client.add_document(
-            ...     collection="kb",
-            ...     doc_id="article_1",
+            ...     collection="auditcity",
+            ...     dataset_id="dallas-dentist",
             ...     text="Long article text...",
-            ...     namespace="tutorials"
+            ...     metadata={"doc_type": "reviews", "location": "Dallas"}
             ... )
         """
-        # Build query parameters
-        params = {"doc_id": doc_id}
-        if namespace:
-            params["namespace"] = namespace
+        import json
 
-        # Send text as raw body (text/plain)
-        url = f"{self.base_url}/collections/{collection}/documents/text"
+        # Build query parameters
+        params = {"dataset_id": dataset_id}
+        if metadata:
+            # Convert dict to JSON string for server
+            params["metadata"] = json.dumps(metadata)
+
+        # Send text as raw body (text/plain) to unified endpoint
+        url = f"{self.base_url}/collections/{collection}/documents"
 
         try:
             response = self.session.post(
@@ -226,65 +270,104 @@ class EmbeddingClient:
 
         except requests.exceptions.RequestException as e:
             raise Exception(f"Request failed: {str(e)}")
-    
-    def delete_document(self, collection: str, doc_id: str) -> dict:
+
+    def delete_document(self, collection: str, dataset_id: str) -> dict:
         """
         Delete a document from a collection.
-        
+
         Args:
             collection: Collection name
-            doc_id: Document ID to delete
-        
+            dataset_id: Dataset identifier to delete
+
         Returns:
             Success message
+
+        Example:
+            >>> client.delete_document("auditcity", "dallas-dentist")
         """
         return self._make_request(
             "DELETE",
-            f"/collections/{collection}/documents/{doc_id}"
+            f"/collections/{collection}/documents/{dataset_id}"
         )
     
     # Search Operations
-    
+
     def search(
         self,
         collection: str,
         query: str,
-        k: int = 10,
-        namespace: Optional[str] = None
+        dataset_id: Optional[str] = None,
+        k: int = 5,
+        filters: Optional[Dict[str, Any]] = None
     ) -> List[SearchResult]:
         """
-        Search for similar documents in a collection.
-        
+        Search for similar documents.
+
         Args:
             collection: Collection to search
             query: Search query text
-            k: Number of results to return (default: 10)
-            namespace: Optional namespace filter
-        
+            dataset_id: Optional dataset to search within (None = search all datasets)
+            k: Number of results to return (default: 5)
+            filters: Optional metadata filters (e.g., {"doc_type": "reviews", "location": "Dallas"})
+
         Returns:
             List of SearchResult objects, sorted by similarity
-            
-        Example:
+
+        Examples:
+            # Search entire collection
             >>> results = client.search(
-            ...     collection="kb",
-            ...     query="How do I reset my password?",
-            ...     k=5,
-            ...     namespace="troubleshooting"
+            ...     collection="auditcity",
+            ...     query="great service",
+            ...     k=10
             ... )
+
+            # Search specific dataset
+            >>> results = client.search(
+            ...     collection="auditcity",
+            ...     dataset_id="dallas-dentist",
+            ...     query="professional staff",
+            ...     k=5
+            ... )
+
+            # Search with metadata filters
+            >>> results = client.search(
+            ...     collection="auditcity",
+            ...     query="amazing experience",
+            ...     filters={"doc_type": "reviews", "verified": True},
+            ...     k=10
+            ... )
+
+            # Access results
             >>> for result in results:
             ...     print(f"Score: {result.score:.3f}")
             ...     print(f"Text: {result.text}")
+            ...     print(f"Dataset: {result.dataset_id}")
+            ...     if result.metadata:
+            ...         print(f"Metadata: {result.metadata}")
         """
+        # Build request body
+        body = {"query": query}
+        if filters:
+            body["filters"] = filters
+
+        # Build URL based on whether dataset_id is provided
+        if dataset_id:
+            # Search specific dataset
+            url = f"/collections/{collection}/{dataset_id}/search"
+        else:
+            # Search entire collection
+            url = f"/collections/{collection}/search"
+
+        # Add k as query parameter
+        params = {"k": k}
+
         response = self._make_request(
             "POST",
-            f"/collections/{collection}/search",
-            json_data={
-                "query": query,
-                "k": k,
-                "namespace": namespace
-            }
+            url,
+            json_data=body,
+            params=params
         )
-        
+
         # Convert to SearchResult objects
         return [SearchResult.from_dict(r) for r in response["results"]]
 
@@ -306,8 +389,31 @@ def create_client(service_url: str) -> EmbeddingClient:
 if __name__ == "__main__":
     print("Embedding Service Client Library")
     print("\nExample usage:")
-    print("  from embedding_client import EmbeddingClient")
-    print("  client = EmbeddingClient('https://your-service.com')")
-    print("  client.create_collection('my_collection')")
-    print("  client.add_document('my_collection', 'doc1', 'text...')")
-    print("  results = client.search('my_collection', 'query', k=10)")
+    print("  from client import EmbeddingClient")
+    print("  ")
+    print("  client = EmbeddingClient('http://localhost:8000')")
+    print("  ")
+    print("  # Create collection")
+    print("  client.create_collection('auditcity')")
+    print("  ")
+    print("  # Add document with metadata")
+    print("  client.add_document(")
+    print("      collection='auditcity',")
+    print("      dataset_id='dallas-dentist',")
+    print("      text='Great service...',")
+    print("      metadata={'doc_type': 'reviews', 'location': 'Dallas'}")
+    print("  )")
+    print("  ")
+    print("  # Search specific dataset")
+    print("  results = client.search(")
+    print("      collection='auditcity',")
+    print("      dataset_id='dallas-dentist',")
+    print("      query='professional staff'")
+    print("  )")
+    print("  ")
+    print("  # Search entire collection")
+    print("  all_results = client.search(")
+    print("      collection='auditcity',")
+    print("      query='great service',")
+    print("      k=10")
+    print("  )")

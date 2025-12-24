@@ -1,8 +1,11 @@
 from typing import List, Tuple
 import numpy as np
+import time
+import random
 from google import genai
 from google.genai import types
 from enum import Enum
+from requests.exceptions import ConnectionError, Timeout
 from service.logging_config import get_component_logger
 
 # Initialize logger for embedder module
@@ -116,6 +119,98 @@ class GeminiEmbedder:
             )
             raise Exception(f"Failed to generate embedding: {str(e)}")
 
+    def _embed_batch_with_retry(
+        self,
+        batch: List[str],
+        task_type: TaskType,
+        batch_num: int,
+        num_batches: int,
+        max_retries: int = 3
+    ) -> List[List[float]]:
+        """
+        Embed a batch with retry logic and exponential backoff.
+
+        Args:
+            batch: List of texts to embed
+            task_type: Type of embedding task
+            batch_num: Current batch number
+            num_batches: Total number of batches
+            max_retries: Maximum number of retry attempts (default: 3)
+
+        Returns:
+            List of embedding vectors
+
+        Raises:
+            Exception: If all retries fail
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                # Call Gemini API for this batch
+                result = self.client.models.embed_content(
+                    model=self.model,
+                    contents=batch,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=self.dimensions
+                    )
+                )
+
+                # Extract and normalize embeddings from this batch
+                batch_embeddings = []
+                for emb in result.embeddings:
+                    embedding = emb.values
+                    embedding = self._normalize_embedding(embedding)
+                    batch_embeddings.append(embedding)
+
+                return batch_embeddings
+
+            except (ConnectionError, Timeout) as e:
+                # Network errors - retry with exponential backoff
+                if attempt < max_retries:
+                    # Exponential backoff: 1s, 2s, 4s
+                    delay = (2 ** attempt) + random.uniform(0, 1)  # Add jitter
+                    logger.warning(
+                        f"Batch {batch_num}/{num_batches} failed (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s...",
+                        extra={
+                            "batch_num": batch_num,
+                            "attempt": attempt + 1,
+                            "error": str(e),
+                            "retry_delay": delay
+                        }
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        f"Batch {batch_num}/{num_batches} failed after {max_retries} retries",
+                        extra={"batch_num": batch_num, "error": str(e)}
+                    )
+                    raise Exception(f"Batch {batch_num} failed after {max_retries} retries: {str(e)}")
+
+            except Exception as e:
+                # Check if it's a retryable error (rate limit, server error)
+                error_str = str(e).lower()
+                is_retryable = any(x in error_str for x in ["429", "rate limit", "500", "503", "timeout", "connection"])
+
+                if is_retryable and attempt < max_retries:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        f"Batch {batch_num}/{num_batches} hit retryable error (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s...",
+                        extra={
+                            "batch_num": batch_num,
+                            "attempt": attempt + 1,
+                            "error": str(e),
+                            "retry_delay": delay
+                        }
+                    )
+                    time.sleep(delay)
+                else:
+                    # Non-retryable error or max retries exceeded
+                    logger.error(
+                        f"Batch {batch_num}/{num_batches} failed with non-retryable error or max retries exceeded",
+                        extra={"batch_num": batch_num, "error": str(e), "is_retryable": is_retryable}
+                    )
+                    raise Exception(f"Batch {batch_num} failed: {str(e)}")
+
     def embed_batch(
         self,
         texts: List[str],
@@ -138,8 +233,9 @@ class GeminiEmbedder:
             ValueError: If texts list is empty
             Exception: If API call fails
         """
-        # Gemini API batch size limit (keeping safe margin)
-        MAX_BATCH_SIZE = 50
+        # Reduced from 50 to 20 for better reliability with large documents
+        # Smaller batches = less likely to timeout, easier to retry
+        MAX_BATCH_SIZE = 20
 
         if not texts:
             raise ValueError("Texts list cannot be empty")
@@ -175,26 +271,24 @@ class GeminiEmbedder:
                     extra={"batch_num": batch_num, "batch_size": len(batch)}
                 )
 
-                # Call Gemini API for this sub-batch
-                result = self.client.models.embed_content(
-                    model=self.model,
-                    contents=batch,
-                    config=types.EmbedContentConfig(
-                        task_type=task_type,
-                        output_dimensionality=self.dimensions
-                    )
+                # Call Gemini API with retry logic
+                batch_embeddings = self._embed_batch_with_retry(
+                    batch=batch,
+                    task_type=task_type,
+                    batch_num=batch_num,
+                    num_batches=num_batches
                 )
 
-                # Extract and normalize embeddings from this batch
-                for emb in result.embeddings:
-                    embedding = emb.values
-                    embedding = self._normalize_embedding(embedding)
-                    all_embeddings.append(embedding)
+                all_embeddings.extend(batch_embeddings)
 
                 logger.debug(
                     f"Sub-batch {batch_num}/{num_batches} completed",
-                    extra={"embeddings_generated": len(result.embeddings)}
+                    extra={"embeddings_generated": len(batch_embeddings)}
                 )
+
+                # Add small delay between batches to avoid rate limiting (except for last batch)
+                if i + MAX_BATCH_SIZE < total_texts:
+                    time.sleep(2)
 
             logger.success(
                 f"Batch embeddings generated successfully: {len(all_embeddings)} vectors",

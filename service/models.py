@@ -31,27 +31,26 @@ class CollectionList(BaseModel):
 # Document Models
 class DocumentAdd(BaseModel):
     """Request model for adding a document."""
-    doc_id: str = Field(..., description="Unique document identifier", min_length=1)
+    dataset_id: str = Field(..., description="Dataset identifier (required - e.g., 'dallas-dentist', 'austin-pizza')", min_length=1)
     text: str = Field(..., description="Document text content", min_length=1)
-    namespace: Optional[str] = Field(None, description="Optional namespace for grouping")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional flexible metadata for filtering (doc_type, rating, category, etc.)")
 
 
 class DocumentAddResponse(BaseModel):
     """Response model after adding a document."""
-    doc_id: str
+    dataset_id: str  # Dataset identifier
     chunks_stored: int
-    namespace: Optional[str]
     message: str
 
 
 class DocumentDelete(BaseModel):
     """Request model for deleting a document."""
-    doc_id: str = Field(..., description="Document ID to delete", min_length=1)
+    dataset_id: str = Field(..., description="Dataset identifier to delete", min_length=1)
 
 
 class DocumentDeleteResponse(BaseModel):
     """Response model after deleting a document."""
-    doc_id: str
+    dataset_id: str
     message: str
 
 
@@ -59,17 +58,22 @@ class DocumentDeleteResponse(BaseModel):
 class SearchRequest(BaseModel):
     """Request model for searching."""
     query: str = Field(..., description="Search query text", min_length=1)
-    k: int = Field(10, description="Number of results to return", ge=1, le=100)
-    namespace: Optional[str] = Field(None, description="Optional namespace filter")
+    filters: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Optional metadata filters (doc_type, rating, category, etc.)",
+        examples=[{"doc_type": "reviews"}, None]
+    )
 
 
 class SearchResultMetadata(BaseModel):
     """Metadata for a search result."""
-    doc_id: str
+    model_config = {"extra": "allow"}  # Allow additional flexible fields
+
+    dataset_id: str  # Dataset identifier
     chunk_index: int
     chunk_count: int
-    namespace: Optional[str]
     created_at: str
+    # Additional metadata fields (doc_type, rating, category, etc.) allowed dynamically
 
 
 class SearchResult(BaseModel):

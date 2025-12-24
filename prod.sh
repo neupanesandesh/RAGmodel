@@ -10,4 +10,4 @@
 #   ./prod.sh logs -f         - Follow logs
 #   ./prod.sh restart         - Restart services
 
-docker-compose -f docker-compose.yml -f docker-compose.prod.yml "$@"
+docker compose -f docker-compose.yml -f docker-compose.prod.yml "$@"

@@ -10,4 +10,4 @@
 #   ./dev.sh logs      - View logs
 #   ./dev.sh restart   - Restart services
 
-docker-compose -f docker-compose.yml -f docker-compose.dev.yml "$@"
+docker compose -f docker-compose.yml -f docker-compose.dev.yml "$@"

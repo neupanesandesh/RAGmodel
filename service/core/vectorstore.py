@@ -14,7 +14,8 @@ from qdrant_client.models import (
     PointStruct,
     Filter,
     FieldCondition,
-    MatchValue
+    MatchValue,
+    PayloadSchemaType
 )
 import uuid
 from service.logging_config import get_component_logger
@@ -26,13 +27,14 @@ logger = get_component_logger("vectorstore")
 class QdrantStore:
     """
     Wrapper for Qdrant vector database operations.
-    
+
     Features:
     - Collection management (create, delete, list)
-    - Document storage with metadata
-    - Semantic search with optional namespace filtering
+    - Payload index creation with tenant isolation support
+    - Document storage with flexible metadata (tenant-based multitenancy)
+    - Semantic search with tenant isolation and flexible filtering
     - Document deletion
-    
+
     Args:
         url: Qdrant server URL (default: localhost:6333)
         api_key: Optional API key for cloud Qdrant
@@ -46,17 +48,18 @@ class QdrantStore:
 
         logger.debug(f"QdrantStore initialized", extra={"url": url, "has_api_key": bool(api_key)})
     
-    def create_collection(self, collection_name: str, vector_size: int = 768) -> bool:
+    def create_collection(self, collection_name: str, vector_size: int = 768, create_document_index: bool = True) -> bool:
         """
         Create a new collection for storing vectors.
-        
+
         Args:
-            collection_name: Name of the collection
+            collection_name: Name of the collection (company name, e.g., 'auditcity')
             vector_size: Dimension of vectors (default: 768)
-        
+            create_document_index: Whether to create dataset_id index (default: True)
+
         Returns:
             True if created successfully
-            
+
         Raises:
             Exception: If collection already exists or creation fails
         """
@@ -84,6 +87,18 @@ class QdrantStore:
                     distance=Distance.COSINE
                 )
             )
+
+            # Create payload index for dataset_id
+            if create_document_index:
+                self.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="dataset_id",
+                    field_schema=PayloadSchemaType.KEYWORD
+                )
+                logger.info(
+                    f"Created dataset_id payload index",
+                    extra={"collection_name": collection_name}
+                )
 
             logger.success(
                 f"Collection created successfully: {collection_name}",
@@ -134,39 +149,93 @@ class QdrantStore:
     def collection_exists(self, collection_name: str) -> bool:
         """
         Check if a collection exists.
-        
+
         Args:
             collection_name: Name of the collection
-            
+
         Returns:
             True if collection exists
         """
         return collection_name in self.list_collections()
-    
+
+    def create_payload_index(
+        self,
+        collection_name: str,
+        field_name: str,
+        field_schema: PayloadSchemaType = PayloadSchemaType.KEYWORD
+    ) -> bool:
+        """
+        Create a payload index for efficient filtering.
+
+        Args:
+            collection_name: Collection to create index in
+            field_name: Payload field to index (e.g., 'tenant_id', 'business_id')
+            field_schema: Field type (KEYWORD for exact match, TEXT for full-text search)
+
+        Returns:
+            True if index created successfully
+
+        Raises:
+            Exception: If collection doesn't exist or index creation fails
+        """
+        if not self.collection_exists(collection_name):
+            raise Exception(f"Collection '{collection_name}' does not exist")
+
+        try:
+            logger.info(
+                f"Creating payload index: {field_name}",
+                extra={
+                    "collection": collection_name,
+                    "field": field_name,
+                    "schema": field_schema
+                }
+            )
+
+            self.client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=field_schema
+            )
+
+            logger.success(
+                f"Payload index created: {field_name}",
+                extra={"collection": collection_name, "field": field_name}
+            )
+            return True
+
+        except Exception as e:
+            logger.error(
+                f"Failed to create payload index: {field_name}",
+                extra={"collection": collection_name, "field": field_name, "error": str(e)}
+            )
+            raise Exception(f"Failed to create payload index: {str(e)}")
+
     def add_document(
         self,
         collection_name: str,
         doc_id: str,
         chunks: List[tuple],  # List of (text, chunk_index)
         embeddings: List[List[float]],
-        namespace: Optional[str] = None
+        dataset_id: str,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> int:
         """
         Add a document's chunks to the collection.
-        
+
         This is the core storage operation. Each chunk becomes a point in Qdrant
-        with its embedding and metadata (text, doc_id, namespace, etc).
-        
+        with its embedding and payload (text, dataset_id, custom metadata, etc).
+
         Args:
-            collection_name: Target collection
-            doc_id: Unique identifier for the document
+            collection_name: Target collection (company name, e.g., 'auditcity')
+            doc_id: Internal identifier (typically same as dataset_id)
             chunks: List of (chunk_text, chunk_index) tuples
             embeddings: List of embedding vectors (one per chunk)
-            namespace: Optional namespace for grouping
-        
+            dataset_id: Document/dataset name (required - e.g., 'dallas-dentist', 'austin-pizza')
+            metadata: Optional flexible metadata dict for filtering (doc_type, rating, category, etc.)
+
         Returns:
             Number of chunks stored
-            
+
         Raises:
             ValueError: If chunks and embeddings length mismatch
             Exception: If storage fails
@@ -179,12 +248,12 @@ class QdrantStore:
 
         try:
             logger.info(
-                f"Adding document to collection: {doc_id}",
+                f"Adding document to collection: {dataset_id}",
                 extra={
                     "collection": collection_name,
-                    "doc_id": doc_id,
+                    "dataset_id": dataset_id,
                     "chunks_count": len(chunks),
-                    "namespace": namespace
+                    "metadata": metadata
                 }
             )
 
@@ -197,18 +266,18 @@ class QdrantStore:
                 # Generate unique point ID
                 point_id = str(uuid.uuid4())
 
-                # Build payload with all metadata
+                # Build payload with core fields
                 payload = {
-                    "doc_id": doc_id,
+                    "dataset_id": dataset_id,  # Document/dataset name (always available)
                     "chunk_index": chunk_index,
                     "chunk_count": chunk_count,
                     "text": chunk_text,
                     "created_at": timestamp
                 }
 
-                # Add namespace if provided
-                if namespace:
-                    payload["namespace"] = namespace
+                # Merge optional metadata if provided
+                if metadata:
+                    payload.update(metadata)
 
                 # Create point
                 point = PointStruct(
@@ -225,10 +294,10 @@ class QdrantStore:
             )
 
             logger.success(
-                f"Document added successfully: {doc_id}",
+                f"Document added successfully: {dataset_id}",
                 extra={
                     "collection": collection_name,
-                    "doc_id": doc_id,
+                    "dataset_id": dataset_id,
                     "points_stored": len(points)
                 }
             )
@@ -237,8 +306,8 @@ class QdrantStore:
 
         except Exception as e:
             logger.error(
-                f"Failed to add document: {doc_id}",
-                extra={"collection": collection_name, "doc_id": doc_id, "error": str(e)}
+                f"Failed to add document: {dataset_id}",
+                extra={"collection": collection_name, "dataset_id": dataset_id, "error": str(e)}
             )
             raise Exception(f"Failed to add document: {str(e)}")
     
@@ -246,22 +315,25 @@ class QdrantStore:
         self,
         collection_name: str,
         query_vector: List[float],
+        dataset_id: Optional[str] = None,
         k: int = 10,
-        namespace: Optional[str] = None
+        filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors in the collection.
-        
+
         Args:
-            collection_name: Collection to search
+            collection_name: Collection to search (company name, e.g., 'auditcity')
             query_vector: Query embedding vector
+            dataset_id: Document/dataset name to search within (optional - e.g., 'dallas-dentist').
+                        If not provided or empty, searches entire collection.
             k: Number of results to return
-            namespace: Optional namespace filter
-        
+            filters: Optional metadata filters (doc_type, rating, category, etc.)
+
         Returns:
             List of search results with score, text, and metadata
             Format: [{"score": float, "text": str, "metadata": dict}, ...]
-            
+
         Raises:
             Exception: If search fails
         """
@@ -269,22 +341,44 @@ class QdrantStore:
             raise Exception(f"Collection '{collection_name}' does not exist")
 
         try:
+            # Normalize dataset_id: treat empty, whitespace, or placeholder values as None
+            if dataset_id:
+                dataset_id = dataset_id.strip()
+                # Treat empty string or common placeholders as None
+                if dataset_id in ("", "string", "null"):
+                    dataset_id = None
+
             logger.debug(
                 f"Searching in collection: {collection_name}",
-                extra={"collection": collection_name, "k": k, "namespace": namespace}
+                extra={"collection": collection_name, "k": k, "dataset_id": dataset_id, "filters": filters}
             )
 
-            # Build filter if namespace specified
-            query_filter = None
-            if namespace:
-                query_filter = Filter(
-                    must=[
-                        FieldCondition(
-                            key="namespace",
-                            match=MatchValue(value=namespace)
-                        )
-                    ]
+            # Build filter conditions
+            must_conditions = []
+
+            # Add dataset_id filter if provided (for document-specific search)
+            if dataset_id:
+                must_conditions.append(
+                    FieldCondition(
+                        key="dataset_id",
+                        match=MatchValue(value=dataset_id)
+                    )
                 )
+
+            # Add additional metadata filters if provided
+            if filters:
+                for key, value in filters.items():
+                    # Skip empty or None values
+                    if value is not None and value != "":
+                        must_conditions.append(
+                            FieldCondition(
+                                key=key,
+                                match=MatchValue(value=value)
+                            )
+                        )
+
+            # Build query filter (None if no conditions)
+            query_filter = Filter(must=must_conditions) if must_conditions else None
 
             # Execute search
             results = self.client.search(
@@ -297,22 +391,32 @@ class QdrantStore:
             # Format results for easy consumption
             formatted_results = []
             for result in results:
+                # Extract core metadata fields
+                metadata = {
+                    "dataset_id": result.payload.get("dataset_id"),
+                    "chunk_index": result.payload.get("chunk_index"),
+                    "chunk_count": result.payload.get("chunk_count"),
+                    "created_at": result.payload.get("created_at")
+                }
+
+                # Add all other payload fields as flexible metadata
+                for key, value in result.payload.items():
+                    if key not in ["text", "chunk_index", "chunk_count", "dataset_id", "created_at"]:
+                        metadata[key] = value
+
                 formatted_results.append({
                     "score": result.score,
                     "text": result.payload.get("text", ""),
-                    "metadata": {
-                        "doc_id": result.payload.get("doc_id"),
-                        "chunk_index": result.payload.get("chunk_index"),
-                        "chunk_count": result.payload.get("chunk_count"),
-                        "namespace": result.payload.get("namespace"),
-                        "created_at": result.payload.get("created_at")
-                    }
+                    "metadata": metadata
                 })
 
+            search_scope = f"document '{dataset_id}'" if dataset_id else "entire collection"
             logger.info(
-                f"Search completed in {collection_name}",
+                f"Search completed in {collection_name} ({search_scope})",
                 extra={
                     "collection": collection_name,
+                    "dataset_id": dataset_id,
+                    "search_scope": search_scope,
                     "results_found": len(formatted_results),
                     "requested": k
                 }
@@ -327,13 +431,13 @@ class QdrantStore:
             )
             raise Exception(f"Search failed: {str(e)}")
     
-    def delete_document(self, collection_name: str, doc_id: str) -> int:
+    def delete_document(self, collection_name: str, dataset_id: str) -> int:
         """
         Delete all chunks of a document from the collection.
 
         Args:
             collection_name: Collection containing the document
-            doc_id: Document ID to delete
+            dataset_id: Document/dataset ID to delete
 
         Returns:
             Number of chunks deleted
@@ -351,8 +455,8 @@ class QdrantStore:
                 scroll_filter=Filter(
                     must=[
                         FieldCondition(
-                            key="doc_id",
-                            match=MatchValue(value=doc_id)
+                            key="dataset_id",
+                            match=MatchValue(value=dataset_id)
                         )
                     ]
                 ),
@@ -361,16 +465,16 @@ class QdrantStore:
 
             # Check if any points were found
             if not results[0]:  # results is a tuple: (points, next_offset)
-                raise Exception(f"Document '{doc_id}' does not exist in collection '{collection_name}'")
+                raise Exception(f"Document '{dataset_id}' does not exist in collection '{collection_name}'")
 
-            # Delete all points with this doc_id
+            # Delete all points with this dataset_id
             self.client.delete(
                 collection_name=collection_name,
                 points_selector=Filter(
                     must=[
                         FieldCondition(
-                            key="doc_id",
-                            match=MatchValue(value=doc_id)
+                            key="dataset_id",
+                            match=MatchValue(value=dataset_id)
                         )
                     ]
                 )
@@ -386,16 +490,16 @@ class QdrantStore:
     def get_collection_info(self, collection_name: str) -> Dict[str, Any]:
         """
         Get information about a collection.
-        
+
         Args:
             collection_name: Collection name
-        
+
         Returns:
             Dictionary with collection stats
         """
         if not self.collection_exists(collection_name):
             raise Exception(f"Collection '{collection_name}' does not exist")
-        
+
         info = self.client.get_collection(collection_name=collection_name)
         return {
             "name": collection_name,
@@ -404,13 +508,54 @@ class QdrantStore:
             "distance": info.config.params.vectors.distance
         }
 
+    def list_datasets(self, collection_name: str) -> List[str]:
+        """
+        List all unique dataset IDs in a collection.
+
+        Args:
+            collection_name: Collection name
+
+        Returns:
+            List of unique dataset_ids
+        """
+        if not self.collection_exists(collection_name):
+            raise Exception(f"Collection '{collection_name}' does not exist")
+
+        # Use scroll to get all points and extract unique dataset_ids
+        dataset_ids = set()
+        offset = None
+
+        while True:
+            # Scroll through points in batches of 100
+            scroll_result = self.client.scroll(
+                collection_name=collection_name,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False  # Don't need vectors, just payload
+            )
+
+            points, next_offset = scroll_result
+
+            # Extract dataset_ids from payloads
+            for point in points:
+                if point.payload and "dataset_id" in point.payload:
+                    dataset_ids.add(point.payload["dataset_id"])
+
+            # Check if there are more points
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return sorted(list(dataset_ids))
+
 
 # Example usage
 if __name__ == "__main__":
     print("QdrantStore - Vector Database Wrapper")
     print("\nExample usage:")
     print("  store = QdrantStore()")
-    print("  store.create_collection('my_collection', vector_size=768)")
-    print("  store.add_document('my_collection', 'doc1', chunks, embeddings)")
-    print("  results = store.search('my_collection', query_vector, k=10)")
+    print("  store.create_collection('embeddings_768d', vector_size=768)")
+    print("  store.add_document('embeddings_768d', 'doc1', chunks, embeddings, tenant_id='company-a', metadata={'category': 'reviews'})")
+    print("  results = store.search('embeddings_768d', query_vector, tenant_id='company-a', k=10)")
     print("\nNote: Requires Qdrant server running on localhost:6333")

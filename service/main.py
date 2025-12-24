@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, status, File, UploadFile, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import time
+import json
 from service.config import settings, validate_settings
 from service.logging_config import setup_logging, get_component_logger, get_request_logger, get_performance_logger
 from service.models import (
@@ -23,7 +24,6 @@ from service.core.vectorstore import QdrantStore
 
 # Initialize logger for main module
 logger = get_component_logger("main")
-
 
 
 # Global instances (initialized on startup)
@@ -234,6 +234,30 @@ async def get_collection_info(collection_name: str):
         )
 
 
+@app.get("/collections/{collection_name}/datasets")
+async def list_datasets(collection_name: str):
+    """
+    List all dataset IDs in a collection.
+
+    Useful for verifying uploads and checking what datasets exist.
+
+    Returns:
+        List of dataset_ids
+    """
+    try:
+        datasets = vector_store.list_datasets(collection_name)
+        return {
+            "collection": collection_name,
+            "datasets": datasets,
+            "count": len(datasets)
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+
+
 @app.delete("/collections/{collection_name}")
 async def delete_collection(collection_name: str):
     """
@@ -264,26 +288,59 @@ async def delete_collection(collection_name: str):
         )
 
 
-# Raw Text Document Endpoint
-@app.post("/collections/{collection_name}/documents/text", response_model=DocumentAddResponse)
-async def add_document_raw_text(
+# Document Upload Endpoint (Text Only)
+@app.post("/collections/{collection_name}/documents", response_model=DocumentAddResponse)
+async def add_document(
     collection_name: str,
-    doc_id: str,
-    namespace: str = None,
-    text: str = Body(..., media_type="text/plain", max_length=10_000_000)  # 10MB max (~2M words, ~500 pages)
+    dataset_id: str,
+    metadata: str = None,  # JSON string of metadata to attach to document
+    text: str = Body(..., media_type="text/plain")  # Raw text content (required)
 ):
+    """
+    Add a document from raw text with optional metadata.
+
+    **Note:** For large datasets (hours of processing), monitor logs to track progress.
+    The process will run until complete - chunking → embedding → storage.
+
+    Args:
+        collection_name: Name of the collection
+        dataset_id: Unique identifier for this document/dataset
+        metadata: JSON string of metadata (e.g., {"doc_type": "reviews", "location": "Dallas"})
+        text: Raw text content
+
+    Example:
+        POST /collections/auditcity/documents?dataset_id=dallas-dentist&metadata={...}
+        Body: "Your raw text here..."
+    """
     start_time = time.time()
     perf_logger = get_performance_logger()
 
     try:
-        # Validate text
+        # Validate text content
         if not text or not text.strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Text content cannot be empty"
             )
 
+        # Parse metadata JSON if provided
+        parsed_metadata = None
+        if metadata:
+            try:
+                parsed_metadata = json.loads(metadata)
+                if not isinstance(parsed_metadata, dict):
+                    raise ValueError("Metadata must be a JSON object")
+            except (json.JSONDecodeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid metadata JSON: {str(e)}"
+                )
+
         # Step 1: Chunk the text
+        logger.info(
+            f"[1/3] Chunking text: {len(text):,} characters",
+            extra={"dataset_id": dataset_id, "text_length": len(text)}
+        )
         chunk_start = time.time()
         chunks = chunk_text(text)
         chunk_time = time.time() - chunk_start
@@ -294,53 +351,83 @@ async def add_document_raw_text(
                 detail="Text resulted in no valid chunks"
             )
 
+        logger.success(
+            f"✓ Chunking complete: {len(chunks)} chunks in {chunk_time:.1f}s",
+            extra={"dataset_id": dataset_id, "chunks_count": len(chunks), "chunking_time_seconds": round(chunk_time, 2)}
+        )
+
         # Step 2: Embed all chunks
+        logger.info(
+            f"[2/3] Embedding {len(chunks)} chunks (this may take several minutes for large datasets)...",
+            extra={"dataset_id": dataset_id, "chunks_count": len(chunks)}
+        )
         embed_start = time.time()
         chunk_texts = [text for text, _ in chunks]
         embeddings = embedder.embed_batch(chunk_texts, task_type="RETRIEVAL_DOCUMENT")
         embed_time = time.time() - embed_start
 
+        logger.success(
+            f"✓ Embedding complete: {len(chunks)} chunks embedded in {embed_time:.1f}s",
+            extra={"dataset_id": dataset_id, "chunks_count": len(chunks), "embedding_time_seconds": round(embed_time, 2)}
+        )
+
         # Step 3: Store in Qdrant
+        logger.info(
+            f"[3/3] Storing {len(chunks)} chunks to Qdrant...",
+            extra={"dataset_id": dataset_id, "collection": collection_name}
+        )
         store_start = time.time()
         chunks_stored = vector_store.add_document(
             collection_name=collection_name,
-            doc_id=doc_id,
+            doc_id=dataset_id,
             chunks=chunks,
             embeddings=embeddings,
-            namespace=namespace
+            dataset_id=dataset_id,
+            metadata=parsed_metadata
         )
         store_time = time.time() - store_start
+
+        logger.success(
+            f"✓ Storage complete: {chunks_stored} chunks stored in {store_time:.1f}s",
+            extra={"dataset_id": dataset_id, "chunks_stored": chunks_stored, "storage_time_seconds": round(store_time, 2)}
+        )
 
         total_time = time.time() - start_time
 
         # Log performance metrics
-        perf_logger.info(
-            f"Document added: {doc_id}",
-            extra={
-                "operation": "add_document",
-                "doc_id": doc_id,
-                "collection": collection_name,
-                "namespace": namespace,
-                "chunks_count": chunks_stored,
-                "text_length": len(text),
-                "timing": {
-                    "total_ms": round(total_time * 1000, 2),
-                    "chunking_ms": round(chunk_time * 1000, 2),
-                    "embedding_ms": round(embed_time * 1000, 2),
-                    "storage_ms": round(store_time * 1000, 2),
-                }
+        perf_extra = {
+            "operation": "add_document",
+            "collection": collection_name,
+            "dataset_id": dataset_id,
+            "metadata": parsed_metadata,
+            "chunks_count": chunks_stored,
+            "text_length": len(text),
+            "timing": {
+                "total_ms": round(total_time * 1000, 2),
+                "chunking_ms": round(chunk_time * 1000, 2),
+                "embedding_ms": round(embed_time * 1000, 2),
+                "storage_ms": round(store_time * 1000, 2),
             }
+        }
+
+        perf_logger.info(
+            f"Document added: {dataset_id}",
+            extra=perf_extra
         )
 
         logger.success(
-            f"Document added to {collection_name}: {doc_id} ({chunks_stored} chunks)",
-            extra={"doc_id": doc_id, "chunks": chunks_stored}
+            f"✓✓✓ UPLOAD COMPLETE: {dataset_id} → {chunks_stored} chunks in {total_time:.1f}s total",
+            extra={
+                "dataset_id": dataset_id,
+                "collection": collection_name,
+                "chunks": chunks_stored,
+                "total_time_seconds": round(total_time, 2)
+            }
         )
 
         return DocumentAddResponse(
-            doc_id=doc_id,
+            dataset_id=dataset_id,
             chunks_stored=chunks_stored,
-            namespace=namespace,
             message=f"Document added successfully with {chunks_stored} chunks"
         )
 
@@ -348,8 +435,8 @@ async def add_document_raw_text(
         raise
     except Exception as e:
         logger.exception(
-            f"Failed to add document {doc_id} to {collection_name}: {str(e)}",
-            extra={"doc_id": doc_id, "collection": collection_name}
+            f"Failed to add document {dataset_id} to {collection_name}: {str(e)}",
+            extra={"dataset_id": dataset_id, "collection": collection_name}
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -357,21 +444,28 @@ async def add_document_raw_text(
         )
 
 
-
-@app.delete("/collections/{collection_name}/documents/{doc_id}")
-async def delete_document(collection_name: str, doc_id: str):
+@app.delete("/collections/{collection_name}/documents/{dataset_id}")
+async def delete_document(collection_name: str, dataset_id: str):
     """
-    Delete a document and all its chunks from a collection.
+    Delete a document/dataset and all its chunks from a collection.
     """
     try:
-        vector_store.delete_document(collection_name, doc_id)
+        vector_store.delete_document(collection_name, dataset_id)
+        logger.warning(
+            f"Document deleted from {collection_name}: {dataset_id}",
+            extra={"collection": collection_name, "dataset_id": dataset_id}
+        )
         return {
-            "message": f"Document '{doc_id}' deleted successfully",
-            "doc_id": doc_id
+            "message": f"Document '{dataset_id}' deleted successfully",
+            "dataset_id": dataset_id
         }
     except Exception as e:
         # Return 404 if collection/document doesn't exist, 400 for other errors
         error_msg = str(e)
+        logger.error(
+            f"Failed to delete document {dataset_id} from {collection_name}",
+            extra={"collection": collection_name, "dataset_id": dataset_id, "error": error_msg}
+        )
         if "does not exist" in error_msg:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -383,13 +477,26 @@ async def delete_document(collection_name: str, doc_id: str):
         )
 
 
-# Search Endpoint
-@app.post("/collections/{collection_name}/search", response_model=SearchResponse)
-async def search(collection_name: str, request: SearchRequest):
-    """
-    Search for similar documents in a collection.
+# Search Endpoints
 
-    This is the retrieval operation - developers search for relevant content.
+# 1. Search within entire collection (all datasets)
+@app.post("/collections/{collection_name}/search", response_model=SearchResponse)
+async def search_collection(
+    collection_name: str,
+    request: SearchRequest,
+    k: int = 5
+):
+    """
+    Search for similar documents across entire collection (all datasets).
+
+    Args:
+        collection_name: Collection to search in (e.g., 'auditcity')
+        request: Search request body with query and optional filters
+        k: Number of results to return (default: 5)
+
+    Example:
+        POST /collections/auditcity/search?k=10
+        Body: {"query": "great service", "filters": {"doc_type": "reviews"}}
     """
     start_time = time.time()
     perf_logger = get_performance_logger()
@@ -400,13 +507,14 @@ async def search(collection_name: str, request: SearchRequest):
         query_vector = embedder.embed_for_search(request.query)
         embed_time = time.time() - embed_start
 
-        # Step 2: Search in Qdrant
+        # Step 2: Search in Qdrant (dataset_id=None searches entire collection)
         search_start = time.time()
         results = vector_store.search(
             collection_name=collection_name,
             query_vector=query_vector,
-            k=request.k,
-            namespace=request.namespace
+            dataset_id=None,  # Search all datasets
+            k=k,
+            filters=request.filters
         )
         search_time = time.time() - search_start
 
@@ -424,13 +532,15 @@ async def search(collection_name: str, request: SearchRequest):
 
         # Log performance metrics
         perf_logger.info(
-            f"Search completed: {request.query[:50]}...",
+            f"Search completed in entire collection: {request.query[:50]}...",
             extra={
-                "operation": "search",
+                "operation": "search_collection",
                 "collection": collection_name,
-                "namespace": request.namespace,
+                "dataset_id": None,
+                "search_scope": "entire_collection",
+                "filters": request.filters,
                 "query_length": len(request.query),
-                "k": request.k,
+                "k": k,
                 "results_count": len(formatted_results),
                 "timing": {
                     "total_ms": round(total_time * 1000, 2),
@@ -441,8 +551,8 @@ async def search(collection_name: str, request: SearchRequest):
         )
 
         logger.info(
-            f"Search in {collection_name} returned {len(formatted_results)} results",
-            extra={"collection": collection_name, "results": len(formatted_results)}
+            f"Search in {collection_name} (all datasets) returned {len(formatted_results)} results",
+            extra={"collection": collection_name, "dataset_id": None, "results": len(formatted_results)}
         )
 
         return SearchResponse(
@@ -455,6 +565,101 @@ async def search(collection_name: str, request: SearchRequest):
         logger.exception(
             f"Search failed in {collection_name}: {str(e)}",
             extra={"collection": collection_name, "query": request.query[:100]}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Search failed: {str(e)}"
+        )
+
+
+# 2. Search within specific dataset
+@app.post("/collections/{collection_name}/{dataset_id}/search", response_model=SearchResponse)
+async def search_dataset(
+    collection_name: str,
+    dataset_id: str,
+    request: SearchRequest,
+    k: int = 5
+):
+    """
+    Search for similar documents in a specific dataset.
+
+    Args:
+        collection_name: Collection to search in (e.g., 'auditcity')
+        dataset_id: Dataset identifier to search within (e.g., 'dallas-dentist')
+        request: Search request body with query and optional filters
+        k: Number of results to return (default: 5)
+
+    Example:
+        POST /collections/auditcity/dallas-dentist/search?k=10
+        Body: {"query": "great service", "filters": {"doc_type": "reviews"}}
+    """
+    start_time = time.time()
+    perf_logger = get_performance_logger()
+
+    try:
+        # Step 1: Embed the search query
+        embed_start = time.time()
+        query_vector = embedder.embed_for_search(request.query)
+        embed_time = time.time() - embed_start
+
+        # Step 2: Search in Qdrant
+        search_start = time.time()
+        results = vector_store.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            dataset_id=dataset_id,
+            k=k,
+            filters=request.filters
+        )
+        search_time = time.time() - search_start
+
+        # Step 3: Format results
+        formatted_results = [
+            SearchResult(
+                score=r["score"],
+                text=r["text"],
+                metadata=SearchResultMetadata(**r["metadata"])
+            )
+            for r in results
+        ]
+
+        total_time = time.time() - start_time
+
+        # Log performance metrics
+        perf_logger.info(
+            f"Search completed in dataset '{dataset_id}': {request.query[:50]}...",
+            extra={
+                "operation": "search_dataset",
+                "collection": collection_name,
+                "dataset_id": dataset_id,
+                "search_scope": f"dataset:{dataset_id}",
+                "filters": request.filters,
+                "query_length": len(request.query),
+                "k": k,
+                "results_count": len(formatted_results),
+                "timing": {
+                    "total_ms": round(total_time * 1000, 2),
+                    "embedding_ms": round(embed_time * 1000, 2),
+                    "search_ms": round(search_time * 1000, 2),
+                }
+            }
+        )
+
+        logger.info(
+            f"Search in {collection_name}/{dataset_id} returned {len(formatted_results)} results",
+            extra={"collection": collection_name, "dataset_id": dataset_id, "results": len(formatted_results)}
+        )
+
+        return SearchResponse(
+            query=request.query,
+            results=formatted_results,
+            count=len(formatted_results)
+        )
+
+    except Exception as e:
+        logger.exception(
+            f"Search failed in {collection_name}/{dataset_id}: {str(e)}",
+            extra={"collection": collection_name, "dataset_id": dataset_id, "query": request.query[:100]}
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
