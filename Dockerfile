@@ -32,6 +32,9 @@ RUN useradd -m -u 1000 appuser && \
 
 USER appuser
 
+# Add user's local bin to PATH (for pytest and other tools installed via pip install --user)
+ENV PATH="/home/appuser/.local/bin:${PATH}"
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1

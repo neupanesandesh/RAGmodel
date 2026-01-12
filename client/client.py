@@ -70,11 +70,13 @@ class EmbeddingClient:
     Example:
         >>> client = EmbeddingClient("http://localhost:8000")
         >>> client.create_collection("auditcity")
-        >>> client.add_document(
+        >>> documents = [
+        ...     {"url": "https://example.com/1", "text": "Your text here...", "meta": {"rating": 5}}
+        ... ]
+        >>> client.add_documents_batch(
         ...     collection="auditcity",
         ...     dataset_id="dallas-dentist",
-        ...     text="Your text here...",
-        ...     metadata={"doc_type": "reviews"}
+        ...     documents=documents
         ... )
         >>> results = client.search(
         ...     collection="auditcity",
@@ -210,66 +212,52 @@ class EmbeddingClient:
     
     # Document Operations
 
-    def add_document(
+    def add_documents_batch(
         self,
         collection: str,
         dataset_id: str,
-        text: str,
-        metadata: Optional[Dict[str, Any]] = None
+        documents: List[Dict[str, Any]]
     ) -> dict:
         """
-        Add a document to a collection.
+        Add multiple preprocessed documents in batch (simple format).
 
-        The text will be automatically chunked, embedded, and stored.
+        Each document should be in format: {url, text, meta}
+        - One document = one chunk (no auto-chunking)
+        - Each chunk stores its own url and metadata
+        - Perfect for preprocessed reviews, products, Q&A, etc.
 
         Args:
             collection: Target collection name
-            dataset_id: Unique dataset identifier (e.g., 'dallas-dentist', 'austin-pizza')
-            text: Document text content
-            metadata: Optional metadata dict (e.g., {"doc_type": "reviews", "location": "Dallas"})
+            dataset_id: Unique dataset identifier
+            documents: List of documents in {url, text, meta} format
 
         Returns:
-            Information about chunks stored
+            Upload summary with counts and warnings
 
         Example:
-            >>> client.add_document(
+            >>> # Load preprocessed reviews
+            >>> with open("reviews_preprocessed.json", "r") as f:
+            ...     docs = json.load(f)
+            >>>
+            >>> # Upload batch
+            >>> response = client.add_documents_batch(
             ...     collection="auditcity",
-            ...     dataset_id="dallas-dentist",
-            ...     text="Long article text...",
-            ...     metadata={"doc_type": "reviews", "location": "Dallas"}
+            ...     dataset_id="lavon-family-dental",
+            ...     documents=docs  # List of {url, text, meta}
             ... )
+            >>>
+            >>> print(f"Uploaded {response['chunks_stored']} documents")
         """
-        import json
+        request_body = {
+            "dataset_id": dataset_id,
+            "documents": documents
+        }
 
-        # Build query parameters
-        params = {"dataset_id": dataset_id}
-        if metadata:
-            # Convert dict to JSON string for server
-            params["metadata"] = json.dumps(metadata)
-
-        # Send text as raw body (text/plain) to unified endpoint
-        url = f"{self.base_url}/collections/{collection}/documents"
-
-        try:
-            response = self.session.post(
-                url,
-                params=params,
-                data=text,
-                headers={"Content-Type": "text/plain"},
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            return response.json()
-
-        except requests.exceptions.HTTPError as e:
-            try:
-                error_detail = e.response.json().get("detail", str(e))
-            except:
-                error_detail = str(e)
-            raise Exception(f"API Error: {error_detail}")
-
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Request failed: {str(e)}")
+        return self._make_request(
+            "POST",
+            f"/collections/{collection}/documents/batch",
+            json_data=request_body
+        )
 
     def delete_document(self, collection: str, dataset_id: str) -> dict:
         """
@@ -396,12 +384,15 @@ if __name__ == "__main__":
     print("  # Create collection")
     print("  client.create_collection('auditcity')")
     print("  ")
-    print("  # Add document with metadata")
-    print("  client.add_document(")
+    print("  # Upload batch documents")
+    print("  documents = [")
+    print("      {'url': 'https://example.com/1', 'text': 'Great service...', 'meta': {'rating': 5}},")
+    print("      {'url': 'https://example.com/2', 'text': 'Amazing experience!', 'meta': {'rating': 5}}")
+    print("  ]")
+    print("  client.add_documents_batch(")
     print("      collection='auditcity',")
     print("      dataset_id='dallas-dentist',")
-    print("      text='Great service...',")
-    print("      metadata={'doc_type': 'reviews', 'location': 'Dallas'}")
+    print("      documents=documents")
     print("  )")
     print("  ")
     print("  # Search specific dataset")

@@ -24,6 +24,7 @@ services:
     volumes:
       - ./service:/app/service        # FastAPI application code
       - ./client:/app/client          # Client library code
+      - ./tests:/app/tests            # Test files for running pytest
       - ./pyproject.toml:/app/pyproject.toml  # Package configuration
       - embedding_logs:/app/logs      # Log files (persistent)
 
@@ -38,11 +39,12 @@ services:
     # ─────────────────────────────────────
     # HOT-RELOAD ENABLED WITH EDITABLE INSTALL
     # ─────────────────────────────────────
-    # Install package in editable mode (pip install -e .) then start with --reload
+    # Install package in editable mode with dev dependencies (pip install -e ".[dev]")
+    # This includes pytest and other dev tools for testing
     # This makes imports work properly: "from client import EmbeddingClient"
     # FastAPI will automatically restart when it detects code changes
     # You'll see "Reloading..." in the logs when you save a file
-    command: sh -c "pip install -e . && python -m uvicorn service.main:app --host 0.0.0.0 --port 8000 --reload"
+    command: sh -c "pip install -e '.[dev]' && python -m uvicorn service.main:app --host 0.0.0.0 --port 8000 --reload"
 
     # ─────────────────────────────────────
     # NO AUTO-RESTART

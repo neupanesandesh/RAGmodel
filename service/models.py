@@ -54,6 +54,29 @@ class DocumentDeleteResponse(BaseModel):
     message: str
 
 
+class SimpleDocument(BaseModel):
+    """Single document in simple format."""
+    url: str = Field(..., description="Source URL for this document", min_length=1)
+    text: str = Field(..., description="Text content to embed", min_length=1)
+    meta: Optional[Dict[str, Any]] = Field(None, description="Optional metadata (rating, author, date, etc.)")
+
+
+class BatchDocumentAdd(BaseModel):
+    """Request model for batch upload of preprocessed documents."""
+    dataset_id: str = Field(..., description="Dataset identifier", min_length=1)
+    documents: List[SimpleDocument] = Field(..., description="List of documents in {url, text, meta} format")
+
+
+class BatchDocumentAddResponse(BaseModel):
+    """Response model after batch document upload."""
+    dataset_id: str
+    documents_processed: int
+    chunks_stored: int
+    documents_skipped: int
+    warnings: List[str] = []
+    message: str
+
+
 # Search Models
 class SearchRequest(BaseModel):
     """Request model for searching."""

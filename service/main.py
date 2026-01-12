@@ -4,7 +4,7 @@ FastAPI Embedding Service
 Main application that exposes REST API endpoints for embedding operations.
 """
 
-from fastapi import FastAPI, HTTPException, status, File, UploadFile, Form, Body, Request
+from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import time
@@ -13,12 +13,11 @@ from service.config import settings, validate_settings
 from service.logging_config import setup_logging, get_component_logger, get_request_logger, get_performance_logger
 from service.models import (
     CollectionCreate, CollectionResponse, CollectionList,
-    DocumentAdd, DocumentAddResponse,
     DocumentDelete, DocumentDeleteResponse,
+    SimpleDocument, BatchDocumentAdd, BatchDocumentAddResponse,
     SearchRequest, SearchResponse, SearchResult, SearchResultMetadata,
     HealthResponse, ErrorResponse
 )
-from service.core.chunking import chunk_text
 from service.core.embedder import GeminiEmbedder
 from service.core.vectorstore import QdrantStore
 
@@ -287,160 +286,202 @@ async def delete_collection(collection_name: str):
             detail=error_msg
         )
 
-
-# Document Upload Endpoint (Text Only)
-@app.post("/collections/{collection_name}/documents", response_model=DocumentAddResponse)
-async def add_document(
+@app.post("/collections/{collection_name}/documents/batch", response_model=BatchDocumentAddResponse)
+async def add_documents_batch(
     collection_name: str,
-    dataset_id: str,
-    metadata: str = None,  # JSON string of metadata to attach to document
-    text: str = Body(..., media_type="text/plain")  # Raw text content (required)
+    request: BatchDocumentAdd
 ):
     """
-    Add a document from raw text with optional metadata.
+    Add multiple preprocessed documents in batch (simple format).
 
-    **Note:** For large datasets (hours of processing), monitor logs to track progress.
-    The process will run until complete - chunking → embedding → storage.
+    Each document should be in format: {url, text, meta}
+    - One document = one chunk (no auto-chunking)
+    - Each chunk stores its own url and metadata
+    - Perfect for preprocessed reviews, products, Q&A, etc.
 
     Args:
         collection_name: Name of the collection
-        dataset_id: Unique identifier for this document/dataset
-        metadata: JSON string of metadata (e.g., {"doc_type": "reviews", "location": "Dallas"})
-        text: Raw text content
+        request: Batch upload request with dataset_id and list of documents
 
     Example:
-        POST /collections/auditcity/documents?dataset_id=dallas-dentist&metadata={...}
-        Body: "Your raw text here..."
+        POST /collections/auditcity/documents/batch
+        {
+          "dataset_id": "lavon-family-dental",
+          "documents": [
+            {
+              "url": "https://review1.com",
+              "text": "Great service!",
+              "meta": {"rating": 5, "author": "John"}
+            },
+            {
+              "url": "https://review2.com",
+              "text": "Not satisfied",
+              "meta": {"rating": 2, "author": "Jane"}
+            }
+          ]
+        }
     """
     start_time = time.time()
     perf_logger = get_performance_logger()
 
     try:
-        # Validate text content
-        if not text or not text.strip():
+        if not request.documents:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Text content cannot be empty"
+                detail="No documents provided"
             )
 
-        # Parse metadata JSON if provided
-        parsed_metadata = None
-        if metadata:
-            try:
-                parsed_metadata = json.loads(metadata)
-                if not isinstance(parsed_metadata, dict):
-                    raise ValueError("Metadata must be a JSON object")
-            except (json.JSONDecodeError, ValueError) as e:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid metadata JSON: {str(e)}"
-                )
-
-        # Step 1: Chunk the text
         logger.info(
-            f"[1/3] Chunking text: {len(text):,} characters",
-            extra={"dataset_id": dataset_id, "text_length": len(text)}
+            f"[1/3] Processing {len(request.documents)} documents...",
+            extra={"dataset_id": request.dataset_id, "documents_count": len(request.documents)}
         )
-        chunk_start = time.time()
-        chunks = chunk_text(text)
-        chunk_time = time.time() - chunk_start
 
-        if not chunks:
+        # Process each document
+        texts = []
+        metadatas = []
+        warnings = []
+        skipped_count = 0
+
+        for idx, doc in enumerate(request.documents):
+            # Validate text
+            if not doc.text or not doc.text.strip():
+                warning = f"Document {idx}: Empty text, skipping"
+                warnings.append(warning)
+                skipped_count += 1
+                continue
+
+            # Build metadata with url
+            metadata = {"url": doc.url}
+
+            # Add optional meta fields
+            if doc.meta:
+                metadata.update(doc.meta)
+
+            texts.append(doc.text)
+            metadatas.append(metadata)
+
+        if not texts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Text resulted in no valid chunks"
+                detail=f"No valid documents found. All {len(request.documents)} documents skipped."
             )
 
         logger.success(
-            f"✓ Chunking complete: {len(chunks)} chunks in {chunk_time:.1f}s",
-            extra={"dataset_id": dataset_id, "chunks_count": len(chunks), "chunking_time_seconds": round(chunk_time, 2)}
+            f"✓ Processed {len(texts)} valid documents ({skipped_count} skipped)",
+            extra={
+                "dataset_id": request.dataset_id,
+                "valid_documents": len(texts),
+                "skipped_documents": skipped_count
+            }
         )
 
-        # Step 2: Embed all chunks
+        # Log warnings if any
+        if warnings:
+            for warning in warnings[:10]:
+                logger.warning(warning, extra={"dataset_id": request.dataset_id})
+            if len(warnings) > 10:
+                logger.warning(
+                    f"... and {len(warnings) - 10} more warnings",
+                    extra={"dataset_id": request.dataset_id}
+                )
+
+        # Step 2: Generate embeddings
         logger.info(
-            f"[2/3] Embedding {len(chunks)} chunks (this may take several minutes for large datasets)...",
-            extra={"dataset_id": dataset_id, "chunks_count": len(chunks)}
+            f"[2/3] Embedding {len(texts)} documents (this may take several minutes)...",
+            extra={"dataset_id": request.dataset_id, "texts_count": len(texts)}
         )
         embed_start = time.time()
-        chunk_texts = [text for text, _ in chunks]
-        embeddings = embedder.embed_batch(chunk_texts, task_type="RETRIEVAL_DOCUMENT")
+        embeddings = embedder.embed_batch(texts, task_type="RETRIEVAL_DOCUMENT")
         embed_time = time.time() - embed_start
 
         logger.success(
-            f"✓ Embedding complete: {len(chunks)} chunks embedded in {embed_time:.1f}s",
-            extra={"dataset_id": dataset_id, "chunks_count": len(chunks), "embedding_time_seconds": round(embed_time, 2)}
+            f"✓ Embedding complete: {len(texts)} documents embedded in {embed_time:.1f}s",
+            extra={"dataset_id": request.dataset_id, "embedding_time_seconds": round(embed_time, 2)}
         )
 
         # Step 3: Store in Qdrant
         logger.info(
-            f"[3/3] Storing {len(chunks)} chunks to Qdrant...",
-            extra={"dataset_id": dataset_id, "collection": collection_name}
+            f"[3/3] Storing {len(texts)} documents to Qdrant...",
+            extra={"dataset_id": request.dataset_id, "collection": collection_name}
         )
         store_start = time.time()
-        chunks_stored = vector_store.add_document(
-            collection_name=collection_name,
-            doc_id=dataset_id,
-            chunks=chunks,
-            embeddings=embeddings,
-            dataset_id=dataset_id,
-            metadata=parsed_metadata
-        )
+
+        # Store each document as a chunk with its metadata
+        chunks_stored = 0
+        for idx, (text, embedding, metadata) in enumerate(zip(texts, embeddings, metadatas)):
+            # Create a single "chunk" tuple for this document
+            chunks = [(text, idx)]
+
+            # Store with its specific metadata
+            stored = vector_store.add_document(
+                collection_name=collection_name,
+                doc_id=f"{request.dataset_id}_doc_{idx}",
+                chunks=chunks,
+                embeddings=[embedding],
+                dataset_id=request.dataset_id,
+                metadata=metadata
+            )
+            chunks_stored += stored
+
         store_time = time.time() - store_start
 
         logger.success(
-            f"✓ Storage complete: {chunks_stored} chunks stored in {store_time:.1f}s",
-            extra={"dataset_id": dataset_id, "chunks_stored": chunks_stored, "storage_time_seconds": round(store_time, 2)}
+            f"✓ Storage complete: {chunks_stored} documents stored in {store_time:.1f}s",
+            extra={"dataset_id": request.dataset_id, "chunks_stored": chunks_stored, "storage_time_seconds": round(store_time, 2)}
         )
 
         total_time = time.time() - start_time
 
         # Log performance metrics
         perf_extra = {
-            "operation": "add_document",
+            "operation": "add_documents_batch",
             "collection": collection_name,
-            "dataset_id": dataset_id,
-            "metadata": parsed_metadata,
-            "chunks_count": chunks_stored,
-            "text_length": len(text),
+            "dataset_id": request.dataset_id,
+            "documents_processed": len(texts),
+            "documents_skipped": skipped_count,
+            "chunks_stored": chunks_stored,
             "timing": {
                 "total_ms": round(total_time * 1000, 2),
-                "chunking_ms": round(chunk_time * 1000, 2),
                 "embedding_ms": round(embed_time * 1000, 2),
                 "storage_ms": round(store_time * 1000, 2),
             }
         }
 
         perf_logger.info(
-            f"Document added: {dataset_id}",
+            f"Batch documents added: {request.dataset_id}",
             extra=perf_extra
         )
 
         logger.success(
-            f"✓✓✓ UPLOAD COMPLETE: {dataset_id} → {chunks_stored} chunks in {total_time:.1f}s total",
+            f"✓✓✓ UPLOAD COMPLETE: {request.dataset_id} → {chunks_stored} documents in {total_time:.1f}s total",
             extra={
-                "dataset_id": dataset_id,
+                "dataset_id": request.dataset_id,
                 "collection": collection_name,
-                "chunks": chunks_stored,
+                "documents": chunks_stored,
+                "skipped": skipped_count,
                 "total_time_seconds": round(total_time, 2)
             }
         )
 
-        return DocumentAddResponse(
-            dataset_id=dataset_id,
+        return BatchDocumentAddResponse(
+            dataset_id=request.dataset_id,
+            documents_processed=len(texts),
             chunks_stored=chunks_stored,
-            message=f"Document added successfully with {chunks_stored} chunks"
+            documents_skipped=skipped_count,
+            warnings=warnings,
+            message=f"Successfully uploaded {chunks_stored} documents ({skipped_count} skipped)"
         )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.exception(
-            f"Failed to add document {dataset_id} to {collection_name}: {str(e)}",
-            extra={"dataset_id": dataset_id, "collection": collection_name}
+            f"Failed to add batch documents {request.dataset_id} to {collection_name}: {str(e)}",
+            extra={"dataset_id": request.dataset_id, "collection": collection_name}
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to add document: {str(e)}"
+            detail=f"Failed to add batch documents: {str(e)}"
         )
 
 
