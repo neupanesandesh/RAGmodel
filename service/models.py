@@ -29,20 +29,6 @@ class CollectionList(BaseModel):
 
 
 # Document Models
-class DocumentAdd(BaseModel):
-    """Request model for adding a document."""
-    dataset_id: str = Field(..., description="Dataset identifier (required - e.g., 'dallas-dentist', 'austin-pizza')", min_length=1)
-    text: str = Field(..., description="Document text content", min_length=1)
-    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional flexible metadata for filtering (doc_type, rating, category, etc.)")
-
-
-class DocumentAddResponse(BaseModel):
-    """Response model after adding a document."""
-    dataset_id: str  # Dataset identifier
-    chunks_stored: int
-    message: str
-
-
 class DocumentDelete(BaseModel):
     """Request model for deleting a document."""
     dataset_id: str = Field(..., description="Dataset identifier to delete", min_length=1)
@@ -63,7 +49,6 @@ class SimpleDocument(BaseModel):
 
 class BatchDocumentAdd(BaseModel):
     """Request model for batch upload of preprocessed documents."""
-    dataset_id: str = Field(..., description="Dataset identifier", min_length=1)
     documents: List[SimpleDocument] = Field(..., description="List of documents in {url, text, meta} format")
 
 

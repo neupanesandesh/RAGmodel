@@ -249,13 +249,12 @@ class EmbeddingClient:
             >>> print(f"Uploaded {response['chunks_stored']} documents")
         """
         request_body = {
-            "dataset_id": dataset_id,
             "documents": documents
         }
 
         return self._make_request(
             "POST",
-            f"/collections/{collection}/documents/batch",
+            f"/collections/{collection}/documents/batch/{dataset_id}",
             json_data=request_body
         )
 

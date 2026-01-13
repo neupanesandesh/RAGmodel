@@ -286,9 +286,10 @@ async def delete_collection(collection_name: str):
             detail=error_msg
         )
 
-@app.post("/collections/{collection_name}/documents/batch", response_model=BatchDocumentAddResponse)
+@app.post("/collections/{collection_name}/documents/batch/{dataset_id}", response_model=BatchDocumentAddResponse)
 async def add_documents_batch(
     collection_name: str,
+    dataset_id: str,
     request: BatchDocumentAdd
 ):
     """
@@ -301,12 +302,12 @@ async def add_documents_batch(
 
     Args:
         collection_name: Name of the collection
-        request: Batch upload request with dataset_id and list of documents
+        dataset_id: Unique identifier for this dataset
+        request: Batch upload request with list of documents
 
     Example:
-        POST /collections/auditcity/documents/batch
+        POST /collections/auditcity/documents/batch/lavon-family-dental
         {
-          "dataset_id": "lavon-family-dental",
           "documents": [
             {
               "url": "https://review1.com",
@@ -333,7 +334,7 @@ async def add_documents_batch(
 
         logger.info(
             f"[1/3] Processing {len(request.documents)} documents...",
-            extra={"dataset_id": request.dataset_id, "documents_count": len(request.documents)}
+            extra={"dataset_id": dataset_id, "documents_count": len(request.documents)}
         )
 
         # Process each document
@@ -369,7 +370,7 @@ async def add_documents_batch(
         logger.success(
             f"✓ Processed {len(texts)} valid documents ({skipped_count} skipped)",
             extra={
-                "dataset_id": request.dataset_id,
+                "dataset_id": dataset_id,
                 "valid_documents": len(texts),
                 "skipped_documents": skipped_count
             }
@@ -378,17 +379,17 @@ async def add_documents_batch(
         # Log warnings if any
         if warnings:
             for warning in warnings[:10]:
-                logger.warning(warning, extra={"dataset_id": request.dataset_id})
+                logger.warning(warning, extra={"dataset_id": dataset_id})
             if len(warnings) > 10:
                 logger.warning(
                     f"... and {len(warnings) - 10} more warnings",
-                    extra={"dataset_id": request.dataset_id}
+                    extra={"dataset_id": dataset_id}
                 )
 
         # Step 2: Generate embeddings
         logger.info(
             f"[2/3] Embedding {len(texts)} documents (this may take several minutes)...",
-            extra={"dataset_id": request.dataset_id, "texts_count": len(texts)}
+            extra={"dataset_id": dataset_id, "texts_count": len(texts)}
         )
         embed_start = time.time()
         embeddings = embedder.embed_batch(texts, task_type="RETRIEVAL_DOCUMENT")
@@ -396,13 +397,13 @@ async def add_documents_batch(
 
         logger.success(
             f"✓ Embedding complete: {len(texts)} documents embedded in {embed_time:.1f}s",
-            extra={"dataset_id": request.dataset_id, "embedding_time_seconds": round(embed_time, 2)}
+            extra={"dataset_id": dataset_id, "embedding_time_seconds": round(embed_time, 2)}
         )
 
         # Step 3: Store in Qdrant
         logger.info(
             f"[3/3] Storing {len(texts)} documents to Qdrant...",
-            extra={"dataset_id": request.dataset_id, "collection": collection_name}
+            extra={"dataset_id": dataset_id, "collection": collection_name}
         )
         store_start = time.time()
 
@@ -415,10 +416,10 @@ async def add_documents_batch(
             # Store with its specific metadata
             stored = vector_store.add_document(
                 collection_name=collection_name,
-                doc_id=f"{request.dataset_id}_doc_{idx}",
+                doc_id=f"{dataset_id}_doc_{idx}",
                 chunks=chunks,
                 embeddings=[embedding],
-                dataset_id=request.dataset_id,
+                dataset_id=dataset_id,
                 metadata=metadata
             )
             chunks_stored += stored
@@ -427,7 +428,7 @@ async def add_documents_batch(
 
         logger.success(
             f"✓ Storage complete: {chunks_stored} documents stored in {store_time:.1f}s",
-            extra={"dataset_id": request.dataset_id, "chunks_stored": chunks_stored, "storage_time_seconds": round(store_time, 2)}
+            extra={"dataset_id": dataset_id, "chunks_stored": chunks_stored, "storage_time_seconds": round(store_time, 2)}
         )
 
         total_time = time.time() - start_time
@@ -436,7 +437,7 @@ async def add_documents_batch(
         perf_extra = {
             "operation": "add_documents_batch",
             "collection": collection_name,
-            "dataset_id": request.dataset_id,
+            "dataset_id": dataset_id,
             "documents_processed": len(texts),
             "documents_skipped": skipped_count,
             "chunks_stored": chunks_stored,
@@ -448,14 +449,14 @@ async def add_documents_batch(
         }
 
         perf_logger.info(
-            f"Batch documents added: {request.dataset_id}",
+            f"Batch documents added: {dataset_id}",
             extra=perf_extra
         )
 
         logger.success(
-            f"✓✓✓ UPLOAD COMPLETE: {request.dataset_id} → {chunks_stored} documents in {total_time:.1f}s total",
+            f"✓✓✓ UPLOAD COMPLETE: {dataset_id} → {chunks_stored} documents in {total_time:.1f}s total",
             extra={
-                "dataset_id": request.dataset_id,
+                "dataset_id": dataset_id,
                 "collection": collection_name,
                 "documents": chunks_stored,
                 "skipped": skipped_count,
@@ -464,7 +465,7 @@ async def add_documents_batch(
         )
 
         return BatchDocumentAddResponse(
-            dataset_id=request.dataset_id,
+            dataset_id=dataset_id,
             documents_processed=len(texts),
             chunks_stored=chunks_stored,
             documents_skipped=skipped_count,
@@ -476,8 +477,8 @@ async def add_documents_batch(
         raise
     except Exception as e:
         logger.exception(
-            f"Failed to add batch documents {request.dataset_id} to {collection_name}: {str(e)}",
-            extra={"dataset_id": request.dataset_id, "collection": collection_name}
+            f"Failed to add batch documents {dataset_id} to {collection_name}: {str(e)}",
+            extra={"dataset_id": dataset_id, "collection": collection_name}
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

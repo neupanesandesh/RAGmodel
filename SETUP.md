@@ -270,15 +270,24 @@ client = EmbeddingClient("http://localhost:8000")
 # Create collection (one per company)
 client.create_collection("auditcity")
 
-# Add document - gets chunked automatically
-client.add_document(
+# Upload batch of documents (recommended approach)
+documents = [
+    {
+        "url": "https://maps.google.com/review1",
+        "text": "Great dentist! Very professional and gentle with kids.",
+        "meta": {"rating": 5, "author_name": "John Smith", "doc_type": "review"}
+    },
+    {
+        "url": "https://maps.google.com/review2",
+        "text": "Amazing service! Clean facility and friendly staff.",
+        "meta": {"rating": 5, "author_name": "Jane Doe", "doc_type": "review"}
+    }
+]
+
+client.add_documents_batch(
     collection="auditcity",
     dataset_id="dallas-dentist",
-    text="Your entire raw text here... thousands of lines... auto-chunked...",
-    metadata={  # Optional
-        "doc_type": "reviews",
-        "location": "Dallas, TX"
-    }
+    documents=documents
 )
 
 # Verify upload
@@ -303,8 +312,8 @@ all_results = client.search(
 # Search with metadata filters
 filtered_results = client.search(
     collection="auditcity",
-    query="amazing food",
-    filters={"doc_type": "reviews", "location": "Austin, TX"},
+    query="great dentist",
+    filters={"doc_type": "review", "rating": 5},
     k=10
 )
 
@@ -312,9 +321,9 @@ filtered_results = client.search(
 for result in results:
     print(f"Score: {result.score:.3f}")
     print(f"Text: {result.text}")
-    print(f"Dataset: {result.dataset_id}")
-    if result.metadata:
-        print(f"Metadata: {result.metadata}")
+    print(f"URL: {result.metadata.get('url')}")  # Source URL
+    print(f"Dataset: {result.metadata.get('dataset_id')}")
+    print(f"Rating: {result.metadata.get('rating')}")
 ```
 
 ---
@@ -327,11 +336,23 @@ curl -X POST http://localhost:8000/collections \
   -H "Content-Type: application/json" \
   -d '{"name":"auditcity"}'
 
-# 2. Add document
-curl -X POST "http://localhost:8000/collections/auditcity/documents?dataset_id=dallas-dentist&metadata={\"doc_type\":\"reviews\"}" \
-  -H "Content-Type: text/plain" \
-  -d "Your entire raw text here...
-      Gets automatically chunked and embedded..."
+# 2. Upload batch of documents
+curl -X POST "http://localhost:8000/collections/auditcity/documents/batch/dallas-dentist" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "documents": [
+      {
+        "url": "https://maps.google.com/review1",
+        "text": "Great dentist! Very professional.",
+        "meta": {"rating": 5, "author_name": "John"}
+      },
+      {
+        "url": "https://maps.google.com/review2",
+        "text": "Amazing service!",
+        "meta": {"rating": 5, "author_name": "Jane"}
+      }
+    ]
+  }'
 
 # 3. List datasets (verify upload)
 curl http://localhost:8000/collections/auditcity/datasets
@@ -349,9 +370,9 @@ curl -X POST "http://localhost:8000/collections/auditcity/search?k=10" \
 # 6. Search with filters
 curl -X POST "http://localhost:8000/collections/auditcity/search?k=10" \
   -H "Content-Type: application/json" \
-  -d '{"query": "great food", "filters": {"doc_type": "reviews"}}'
+  -d '{"query": "great dentist", "filters": {"doc_type": "review", "rating": 5}}'
 
-# 7. Delete document
+# 7. Delete dataset
 curl -X DELETE http://localhost:8000/collections/auditcity/documents/dallas-dentist
 ```
 
@@ -368,17 +389,18 @@ curl -X DELETE http://localhost:8000/collections/auditcity/documents/dallas-dent
 | `/collections/{name}` | GET | Get collection info | - | - |
 | `/collections/{name}` | DELETE | Delete collection | - | - |
 | `/collections/{name}/datasets` | GET | List all dataset IDs | - | - |
-| `/collections/{name}/documents` | POST | Add document | `dataset_id`, `text` (body) | `metadata` (JSON) |
-| `/collections/{name}/documents/{dataset_id}` | DELETE | Delete document | - | - |
+| `/collections/{name}/documents/batch/{dataset_id}` | POST | Upload batch of documents | `documents` (body) | - |
+| `/collections/{name}/documents/{dataset_id}` | DELETE | Delete dataset | - | - |
 | `/collections/{name}/search` | POST | Search entire collection | `query` (body) | `k` (default: 5), `filters` |
 | `/collections/{name}/{dataset_id}/search` | POST | Search specific dataset | `query` (body) | `k` (default: 5), `filters` |
 
 **Key Features:**
-- **Simple Upload**: Text-based document upload
+- **Batch Upload**: Upload multiple documents in one request with {url, text, meta} format
+- **RESTful Design**: dataset_id in URL path for clarity
 - **Clear Search Routing**: Separate endpoints for collection vs dataset search
 - **Flexible Search**: Configurable top-k (default: 5)
 - **Metadata Filtering**: Custom filters to narrow results
-- **Automatic Chunking**: Large texts automatically split into optimal chunks
+- **Source Tracking**: Each document includes its URL for citation
 - **Retry Logic**: Robust retry mechanism with exponential backoff
 - **No Timeout Limits**: Upload process runs until complete
 
@@ -497,7 +519,7 @@ Colored console output, DEBUG level, human-readable:
 ```
 2025-12-07 10:30:15 | INFO     | Starting Embedding Service
 2025-12-07 10:30:16 | SUCCESS  | Gemini embedder initialized
-2025-12-07 10:30:17 | INFO     | POST /collections/docs/documents
+2025-12-07 10:30:17 | INFO     | POST /collections/auditcity/documents/batch/dallas-dentist
 ```
 
 ### **Production Logging**
