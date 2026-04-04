@@ -4,8 +4,10 @@ FastAPI Embedding Service
 Main application that exposes REST API endpoints for embedding operations.
 """
 
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 import time
 import json
@@ -709,11 +711,21 @@ async def search_dataset(
         )
 
 
-# Root endpoint
-@app.get("/")
+# Static files and UI
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", include_in_schema=False, response_class=HTMLResponse)
 async def root():
+    """Serve the web UI."""
+    html_file = STATIC_DIR / "index.html"
+    return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
+
+
+@app.get("/api")
+async def api_info():
     """
-    Root endpoint with service information.
+    API info endpoint with service information.
     """
     return {
         "service": "Embedding Service",
