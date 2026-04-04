@@ -48,9 +48,10 @@ def validate_settings():
 
     errors = []
 
-    # Check Gemini API key
+    # Check Gemini API key (warn but don't block startup)
     if not settings.gemini_api_key:
-        errors.append("GEMINI_API_KEY is required but not set")
+        import logging
+        logging.warning("GEMINI_API_KEY is not set - embedding features will be unavailable")
 
     # Check embedding dimension is valid
     valid_dimensions = [768, 1536, 3072]

@@ -59,15 +59,18 @@ async def lifespan(app: FastAPI):
 
     # Initialize services
     try:
-        embedder = GeminiEmbedder(
-            api_key=settings.gemini_api_key,
-            model=settings.gemini_model,
-            dimensions=settings.embedding_dimension
-        )
-        logger.success(
-            "Gemini embedder initialized",
-            extra={"model": settings.gemini_model, "dimensions": settings.embedding_dimension}
-        )
+        if settings.gemini_api_key:
+            embedder = GeminiEmbedder(
+                api_key=settings.gemini_api_key,
+                model=settings.gemini_model,
+                dimensions=settings.embedding_dimension
+            )
+            logger.success(
+                "Gemini embedder initialized",
+                extra={"model": settings.gemini_model, "dimensions": settings.embedding_dimension}
+            )
+        else:
+            logger.warning("Gemini API key not set - embedder unavailable, search/upload disabled")
 
         vector_store = QdrantStore(
             url=settings.qdrant_url,
@@ -324,6 +327,9 @@ async def add_documents_batch(
           ]
         }
     """
+    if not embedder:
+        raise HTTPException(status_code=503, detail="Embedder not configured - set GEMINI_API_KEY to enable uploads")
+
     start_time = time.time()
     perf_logger = get_performance_logger()
 
@@ -542,6 +548,9 @@ async def search_collection(
         POST /collections/auditcity/search?k=10
         Body: {"query": "great service", "filters": {"doc_type": "reviews"}}
     """
+    if not embedder:
+        raise HTTPException(status_code=503, detail="Embedder not configured - set GEMINI_API_KEY to enable search")
+
     start_time = time.time()
     perf_logger = get_performance_logger()
 
@@ -637,6 +646,9 @@ async def search_dataset(
         POST /collections/auditcity/dallas-dentist/search?k=10
         Body: {"query": "great service", "filters": {"doc_type": "reviews"}}
     """
+    if not embedder:
+        raise HTTPException(status_code=503, detail="Embedder not configured - set GEMINI_API_KEY to enable search")
+
     start_time = time.time()
     perf_logger = get_performance_logger()
 
