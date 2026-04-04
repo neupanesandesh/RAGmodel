@@ -23,7 +23,7 @@ services:
       dockerfile: Dockerfile
     container_name: embedding-service
     ports:
-      - "8000:8000"
+      - "5000:8000"
     environment:
       # Gemini Configuration
       - GEMINI_API_KEY=${GEMINI_API_KEY}
