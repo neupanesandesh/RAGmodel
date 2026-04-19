@@ -1,67 +1,92 @@
+# Base stack: Weaviate + service. Dev and prod compose files extend this.
 services:
-  # Qdrant Vector Database
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: embedding-qdrant
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
+    container_name: rag-weaviate
     restart: unless-stopped
     ports:
-      - "6333:6333" # REST API
-      - "6334:6334" # gRPC API
-    volumes:
-      - qdrant_storage:/qdrant/storage
+      - "8080:8080"   # HTTP/REST
+      - "50051:50051" # gRPC
     environment:
-      - QDRANT__SERVICE__HTTP_PORT=6333
-      - QDRANT__SERVICE__GRPC_PORT=6334
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+      AUTOSCHEMA_ENABLED: "true"
+      CLUSTER_HOSTNAME: "node1"
+      DISABLE_TELEMETRY: "true"
+      LIMIT_RESOURCES: "true"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
     networks:
-      - embedding-network
+      - rag-network
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
-  # Embedding Service
-  # Base configuration - common settings for both dev and prod
-  embedding-service:
+  rag-service:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: embedding-service
+    container_name: rag-service
+    restart: unless-stopped
     ports:
-      - "5000:8000"
+      - "8000:8000"
     environment:
-      # Gemini Configuration
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL:-models/gemini-embedding-001}
-      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-768}
+      # Weaviate
+      WEAVIATE_HOST: weaviate
+      WEAVIATE_HTTP_PORT: "8080"
+      WEAVIATE_GRPC_PORT: "50051"
+      WEAVIATE_COLLECTION: ${WEAVIATE_COLLECTION:-Document}
 
-      # Qdrant Configuration
-      - QDRANT_URL=http://qdrant:6333
+      # Embedder
+      EMBEDDER_BACKEND: ${EMBEDDER_BACKEND:-st}
+      ST_MODEL: ${ST_MODEL:-BAAI/bge-small-en-v1.5}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
 
-      # Service Configuration
-      - SERVICE_HOST=0.0.0.0
-      - SERVICE_PORT=8000
+      # Optional Gemini (needed only for /generate)
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_GENERATIVE_MODEL: ${GEMINI_GENERATIVE_MODEL:-gemini-2.5-flash}
 
-      # Logging Configuration
-      - ENVIRONMENT=${ENVIRONMENT:-development}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - LOG_DIR=/app/logs
-      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
-      - LOG_ROTATION_SIZE=${LOG_ROTATION_SIZE:-100 MB}
+      # Service
+      SERVICE_HOST: 0.0.0.0
+      SERVICE_PORT: "8000"
+      API_KEY: ${API_KEY:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+
+      # Observability
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_DIR: /app/logs
+      ENABLE_METRICS: "true"
+
+      # Huggingface cache (survives rebuilds via named volume)
+      HF_HOME: /app/.cache/huggingface
     volumes:
-      - embedding_logs:/app/logs
+      - rag_logs:/app/logs
+      - hf_cache:/app/.cache/huggingface
     depends_on:
-      - qdrant
+      weaviate:
+        condition: service_healthy
     networks:
-      - embedding-network
+      - rag-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
       interval: 15s
       timeout: 5s
-      retries: 3
-      start_period: 20s
+      retries: 5
+      start_period: 30s
 
 volumes:
-  qdrant_storage:
-    driver: local
-  embedding_logs:
-    driver: local
+  weaviate_data:
+  rag_logs:
+  hf_cache:
 
 networks:
-  embedding-network:
+  rag-network:
     driver: bridge

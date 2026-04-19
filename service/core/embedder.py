@@ -1,366 +1,232 @@
-from typing import List, Tuple
-import numpy as np
-import time
+"""Pluggable embedder backends.
+
+Two backends are supported out of the box:
+
+  * ``SentenceTransformerEmbedder`` — local, open source, the default.
+    Uses BAAI/bge-small-en-v1.5 by default. Asymmetric encoding
+    (query vs. passage) via BGE's recommended query instruction prefix.
+    No external services, no API keys.
+
+  * ``GeminiEmbedder`` — Google Gemini ``gemini-embedding-001``. Requires
+    ``GEMINI_API_KEY``. Uses ``RETRIEVAL_DOCUMENT`` / ``RETRIEVAL_QUERY``
+    task types for asymmetric encoding. Retries with exponential backoff
+    and jitter on transient errors.
+
+Both backends implement the :class:`Embedder` protocol. The service
+chooses between them via the ``EMBEDDER_BACKEND`` setting; no code path
+outside this module knows which backend is active.
+"""
+
+from __future__ import annotations
+
+import os
 import random
-from google import genai
-from google.genai import types
-from enum import Enum
-from requests.exceptions import ConnectionError, Timeout
+import time
+from typing import Protocol
+
+import numpy as np
+
 from service.logging_config import get_component_logger
 
-# Initialize logger for embedder module
 logger = get_component_logger("embedder")
 
-class TaskType(str, Enum):
-    RETRIEVAL_DOCUMENT = "RETRIEVAL_DOCUMENT"
-    RETRIEVAL_QUERY = "RETRIEVAL_QUERY"
+
+# BGE-v1.5 recommends this instruction prefix for queries only. Passages
+# are encoded without a prefix. See the model card:
+# https://huggingface.co/BAAI/bge-small-en-v1.5
+_BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
 
-class GeminiEmbedder:
-    
+class Embedder(Protocol):
+    """Shared embedder interface."""
+
+    @property
+    def dimensions(self) -> int: ...
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+
+    def embed_query(self, query: str) -> list[float]: ...
+
+
+# ---------------------------------------------------------------------------
+# Sentence-Transformers (default)
+# ---------------------------------------------------------------------------
+class SentenceTransformerEmbedder:
+    """Local embedder backed by ``sentence-transformers``.
+
+    The model is loaded at construction time so the first request does not
+    pay the download/load cost.
+    """
+
     def __init__(
         self,
-        api_key: str = None,
-        model: str ="gemini-embedding-001",
-        dimensions: int = 768
-    ):
-        self.model = model
-        self.dimensions = dimensions
+        model_name: str = "BAAI/bge-small-en-v1.5",
+        device: str | None = None,
+    ) -> None:
+        # Imported lazily so the dependency is only required when this
+        # backend is actually used.
+        from sentence_transformers import SentenceTransformer
 
-        if api_key:
-            self.client = genai.Client(api_key=api_key)
-        else:
-            self.client = genai.Client()
+        self._model_name = model_name
+        self._model = SentenceTransformer(model_name, device=device)
+        self._dimensions = int(self._model.get_sentence_embedding_dimension())
+        self._is_bge = "bge" in model_name.lower()
 
-        logger.debug(
-            "GeminiEmbedder initialized",
-            extra={"model": self.model, "dimensions": self.dimensions}
+        logger.success(
+            "SentenceTransformer embedder loaded",
+            extra={
+                "model": model_name,
+                "dimensions": self._dimensions,
+                "device": str(self._model.device),
+                "asymmetric_queries": self._is_bge,
+            },
         )
-            
 
-    def _normalize_embedding(self, embedding: List[float]) -> List[float]:
-        """
-        Normalize an embedding vector to unit length.
-        Required for 768 and 1536 dimensions (3072 comes pre-normalized).
-        
-        Normalization ensures we measure angular similarity (direction)
-        rather than magnitude, which is correct for semantic comparison.
-        
-        Args:
-            embedding: Raw embedding vector
-            
-        Returns:
-            Normalized embedding vector
-        """
-        embedding_array = np.array(embedding)
-        norm = np.linalg.norm(embedding_array)
-        
-        if norm == 0:
-            return embedding  # Avoid division by zero
-        
-        normalized = embedding_array / norm
-        return normalized.tolist()
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
 
-    def embed_single(
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        vectors = self._model.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return [v.tolist() for v in vectors]
+
+    def embed_query(self, query: str) -> list[float]:
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty")
+        text = f"{_BGE_QUERY_INSTRUCTION}{query}" if self._is_bge else query
+        vector = self._model.encode(
+            text,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return vector.tolist()
+
+
+# ---------------------------------------------------------------------------
+# Gemini (optional)
+# ---------------------------------------------------------------------------
+class GeminiEmbedder:
+    """Embedder backed by Gemini's ``gemini-embedding-001`` model."""
+
+    def __init__(
         self,
-        text: str,
-        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT
-    ) -> List[float]:
-        """
-        Generate embedding for a single text.
+        api_key: str,
+        model: str = "gemini-embedding-001",
+        dimensions: int = 768,
+    ) -> None:
+        from google import genai  # lazy import
 
-        Args:
-            text: Text to embed
-            task_type: Either "RETRIEVAL_DOCUMENT" (for indexing) or
-                        "RETRIEVAL_QUERY" (for search queries)
+        self._client = genai.Client(api_key=api_key)
+        self._model = model
+        self._dimensions = dimensions
+        logger.success(
+            "Gemini embedder initialized",
+            extra={"model": model, "dimensions": dimensions},
+        )
 
-        Returns:
-            Normalized embedding vector
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
 
-        Raises:
-            ValueError: If text is empty or too long
-            Exception: If API call fails
-        """
-        if not text or not text.strip():
-            raise ValueError("Text cannot be empty")
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts, task_type="RETRIEVAL_DOCUMENT")
 
-        try:
-            logger.debug(
-                f"Generating single embedding (task_type={task_type})",
-                extra={"text_length": len(text), "task_type": task_type}
-            )
+    def embed_query(self, query: str) -> list[float]:
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty")
+        return self._embed([query], task_type="RETRIEVAL_QUERY")[0]
 
-            result = self.client.models.embed_content(
-                model=self.model,
-                contents=text,
-                config=types.EmbedContentConfig(
-                    task_type=task_type,
-                    output_dimensionality=self.dimensions
-                )
-            )
-
-            # Extract embedding values
-            embedding = result.embeddings[0].values
-
-            # Normalize if not using 3072 dimensions
-            embedding = self._normalize_embedding(embedding)
-
-            logger.debug(
-                "Single embedding generated successfully",
-                extra={"vector_dimension": len(embedding)}
-            )
-
-            return embedding
-
-        except Exception as e:
-            logger.error(
-                f"Failed to generate single embedding: {str(e)}",
-                extra={"text_length": len(text), "task_type": task_type}
-            )
-            raise Exception(f"Failed to generate embedding: {str(e)}")
-
-    def _embed_batch_with_retry(
-        self,
-        batch: List[str],
-        task_type: TaskType,
-        batch_num: int,
-        num_batches: int,
-        max_retries: int = 3
-    ) -> List[List[float]]:
-        """
-        Embed a batch with retry logic and exponential backoff.
-
-        Args:
-            batch: List of texts to embed
-            task_type: Type of embedding task
-            batch_num: Current batch number
-            num_batches: Total number of batches
-            max_retries: Maximum number of retry attempts (default: 3)
-
-        Returns:
-            List of embedding vectors
-
-        Raises:
-            Exception: If all retries fail
-        """
-        for attempt in range(max_retries + 1):
-            try:
-                # Call Gemini API for this batch
-                result = self.client.models.embed_content(
-                    model=self.model,
-                    contents=batch,
-                    config=types.EmbedContentConfig(
-                        task_type=task_type,
-                        output_dimensionality=self.dimensions
-                    )
-                )
-
-                # Extract and normalize embeddings from this batch
-                batch_embeddings = []
-                for emb in result.embeddings:
-                    embedding = emb.values
-                    embedding = self._normalize_embedding(embedding)
-                    batch_embeddings.append(embedding)
-
-                return batch_embeddings
-
-            except (ConnectionError, Timeout) as e:
-                # Network errors - retry with exponential backoff
-                if attempt < max_retries:
-                    # Exponential backoff: 1s, 2s, 4s
-                    delay = (2 ** attempt) + random.uniform(0, 1)  # Add jitter
-                    logger.warning(
-                        f"Batch {batch_num}/{num_batches} failed (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s...",
-                        extra={
-                            "batch_num": batch_num,
-                            "attempt": attempt + 1,
-                            "error": str(e),
-                            "retry_delay": delay
-                        }
-                    )
-                    time.sleep(delay)
-                else:
-                    logger.error(
-                        f"Batch {batch_num}/{num_batches} failed after {max_retries} retries",
-                        extra={"batch_num": batch_num, "error": str(e)}
-                    )
-                    raise Exception(f"Batch {batch_num} failed after {max_retries} retries: {str(e)}")
-
-            except Exception as e:
-                # Check if it's a retryable error (rate limit, server error)
-                error_str = str(e).lower()
-                is_retryable = any(x in error_str for x in ["429", "rate limit", "500", "503", "timeout", "connection"])
-
-                if is_retryable and attempt < max_retries:
-                    delay = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(
-                        f"Batch {batch_num}/{num_batches} hit retryable error (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s...",
-                        extra={
-                            "batch_num": batch_num,
-                            "attempt": attempt + 1,
-                            "error": str(e),
-                            "retry_delay": delay
-                        }
-                    )
-                    time.sleep(delay)
-                else:
-                    # Non-retryable error or max retries exceeded
-                    logger.error(
-                        f"Batch {batch_num}/{num_batches} failed with non-retryable error or max retries exceeded",
-                        extra={"batch_num": batch_num, "error": str(e), "is_retryable": is_retryable}
-                    )
-                    raise Exception(f"Batch {batch_num} failed: {str(e)}")
-
-    def embed_batch(
-        self,
-        texts: List[str],
-        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT
-    ) -> List[List[float]]:
-        """
-        Generate embeddings for multiple texts with automatic batching.
-
-        Handles large document chunking by splitting into sub-batches of 50 texts
-        to stay within Gemini API limits (max 100 texts per request).
-
-        Args:
-            texts: List of texts to embed
-            task_type: Either "RETRIEVAL_DOCUMENT" or "RETRIEVAL_QUERY"
-
-        Returns:
-            List of normalized embedding vectors
-
-        Raises:
-            ValueError: If texts list is empty
-            Exception: If API call fails
-        """
-        # Reduced from 50 to 20 for better reliability with large documents
-        # Smaller batches = less likely to timeout, easier to retry
-        MAX_BATCH_SIZE = 20
+    # ------------------------------------------------------------------
+    def _embed(self, texts: list[str], task_type: str) -> list[list[float]]:
+        from google.genai import types
 
         if not texts:
-            raise ValueError("Texts list cannot be empty")
+            return []
 
-        # Filter out empty texts
-        valid_texts = [t for t in texts if t and t.strip()]
-        if not valid_texts:
-            raise ValueError("All texts are empty")
+        batch_size = 90  # Gemini hard limit is 100; 90 leaves headroom.
+        all_vectors: list[list[float]] = []
 
-        try:
-            total_texts = len(valid_texts)
-            num_batches = (total_texts + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
-
-            logger.info(
-                f"Generating batch embeddings for {total_texts} texts in {num_batches} batch(es)",
-                extra={
-                    "batch_size": total_texts,
-                    "sub_batches": num_batches,
-                    "task_type": task_type,
-                    "total_chars": sum(len(t) for t in valid_texts)
-                }
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+            vectors = self._call_with_retry(
+                batch=batch, task_type=task_type, config_cls=types.EmbedContentConfig
             )
+            all_vectors.extend(vectors)
 
-            all_embeddings = []
+        return all_vectors
 
-            # Process in sub-batches
-            for i in range(0, total_texts, MAX_BATCH_SIZE):
-                batch = valid_texts[i:i + MAX_BATCH_SIZE]
-                batch_num = (i // MAX_BATCH_SIZE) + 1
-
-                logger.debug(
-                    f"Processing sub-batch {batch_num}/{num_batches} ({len(batch)} texts)",
-                    extra={"batch_num": batch_num, "batch_size": len(batch)}
+    def _call_with_retry(
+        self,
+        batch: list[str],
+        task_type: str,
+        config_cls,
+        max_retries: int = 3,
+    ) -> list[list[float]]:
+        for attempt in range(max_retries + 1):
+            try:
+                result = self._client.models.embed_content(
+                    model=self._model,
+                    contents=batch,
+                    config=config_cls(
+                        task_type=task_type,
+                        output_dimensionality=self._dimensions,
+                    ),
                 )
-
-                # Call Gemini API with retry logic
-                batch_embeddings = self._embed_batch_with_retry(
-                    batch=batch,
-                    task_type=task_type,
-                    batch_num=batch_num,
-                    num_batches=num_batches
+                return [self._normalize(e.values) for e in result.embeddings]
+            except Exception as e:
+                retryable = any(
+                    tok in str(e).lower()
+                    for tok in ("429", "rate", "500", "503", "timeout", "connection")
                 )
-
-                all_embeddings.extend(batch_embeddings)
-
-                logger.debug(
-                    f"Sub-batch {batch_num}/{num_batches} completed",
-                    extra={"embeddings_generated": len(batch_embeddings)}
+                if attempt >= max_retries or not retryable:
+                    raise
+                delay = (2**attempt) + random.uniform(0, 1)
+                logger.warning(
+                    "Gemini embed retry",
+                    extra={
+                        "attempt": attempt + 1,
+                        "delay_s": round(delay, 2),
+                        "error": str(e)[:200],
+                    },
                 )
+                time.sleep(delay)
+        raise RuntimeError("unreachable")
 
-                # Add small delay between batches to avoid rate limiting (except for last batch)
-                if i + MAX_BATCH_SIZE < total_texts:
-                    time.sleep(2)
+    @staticmethod
+    def _normalize(values: list[float]) -> list[float]:
+        arr = np.asarray(values, dtype=np.float32)
+        norm = float(np.linalg.norm(arr))
+        if norm == 0.0:
+            return arr.tolist()
+        return (arr / norm).tolist()
 
-            logger.success(
-                f"Batch embeddings generated successfully: {len(all_embeddings)} vectors",
-                extra={
-                    "embeddings_count": len(all_embeddings),
-                    "dimension": self.dimensions,
-                    "sub_batches": num_batches
-                }
-            )
 
-            return all_embeddings
-
-        except Exception as e:
-            logger.error(
-                f"Failed to generate batch embeddings: {str(e)}",
-                extra={"batch_size": len(valid_texts), "task_type": task_type}
-            )
-            raise Exception(f"Failed to generate batch embeddings: {str(e)}")
-
-    def embed_for_indexing(self, text: str) -> List[float]:
-        """
-        Convenience method: Embed text for indexing (storage).
-        Uses RETRIEVAL_DOCUMENT task type.
-
-        Args:
-            text: Document text to embed
-
-        Returns:
-            Normalized embedding vector
-        """
-        return self.embed_single(text, task_type=TaskType.RETRIEVAL_DOCUMENT)
-
-    def embed_for_search(self, query: str) -> List[float]:
-        """
-        Convenience method: Embed query for searching.
-        Uses RETRIEVAL_QUERY task type.
-
-        Args:
-            query: Search query text
-
-        Returns:
-            Normalized embedding vector
-        """
-        return self.embed_single(query, task_type=TaskType.RETRIEVAL_QUERY)
-
-# if __name__ == "__main__":
-#     import os
-    
-#     # Check if API key is available
-#     if not os.getenv("GEMINI_API_KEY"):
-#         print("Set GEMINI_API_KEY environment variable to test")
-#         print("\nExample usage:")
-#         print("  embedder = GeminiEmbedder()")
-#         print("  vector = embedder.embed_for_indexing('Your text here')")
-#         print("  print(f'Vector dimension: {len(vector)}')")
-#     else:
-#         # Test with actual API
-#         embedder = GeminiEmbedder()
-        
-#         # Test single embedding
-#         text = "What is the meaning of life?"
-#         embedding = embedder.embed_for_search(text)
-#         print(f"Single embedding dimension: {len(embedding)}")
-#         print(f"Normalized (should be ~1.0): {np.linalg.norm(embedding):.6f}")
-        
-#         # Test batch embedding
-#         texts = [
-#             "What is the meaning of life?",
-#             "How do I bake a cake?",
-#             "What is machine learning?"
-#         ]
-#         embeddings = embedder.embed_batch(texts)
-#         print(f"\nBatch embeddings count: {len(embeddings)}")
-#         for i, emb in enumerate(embeddings):
-#             print(f"  Embedding {i}: {len(emb)} dimensions, norm: {np.linalg.norm(emb):.6f}")
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+def build_embedder(backend: str, **kwargs) -> Embedder:
+    """Return an embedder instance for the named backend."""
+    backend = backend.lower()
+    if backend == "st":
+        return SentenceTransformerEmbedder(
+            model_name=kwargs.get("model_name", "BAAI/bge-small-en-v1.5"),
+            device=kwargs.get("device"),
+        )
+    if backend == "gemini":
+        api_key = kwargs.get("api_key") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GeminiEmbedder requires GEMINI_API_KEY")
+        return GeminiEmbedder(
+            api_key=api_key,
+            model=kwargs.get("model", "gemini-embedding-001"),
+            dimensions=kwargs.get("dimensions", 768),
+        )
+    raise ValueError(f"Unknown embedder backend: {backend!r}")

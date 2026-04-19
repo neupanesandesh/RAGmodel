@@ -75,10 +75,15 @@ logs/
 *.log
 *.zip
 
-# Qdrant data
-qdrant_storage/
+# Vector DB / model caches
+weaviate_data/
+hf_cache/
+.cache/huggingface/
 
 # Local development
 *.local
 .temp/
 temp/
+
+# Stray artefacts
+*.jsonl

@@ -1,65 +1,19 @@
-# ========================================
-# DEVELOPMENT CONFIGURATION
-# ========================================
-#
-# This file adds development-specific settings on top of docker-compose.yml
+# Dev overlay. Mounts code for hot-reload and flips logging to DEBUG.
 #
 # Usage:
-#   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
-#
-# Or create an alias in your shell:
-#   alias dcdev="docker-compose -f docker-compose.yml -f docker-compose.dev.yml"
-#   Then use: dcdev up
-#
-# ========================================
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 
 services:
-  embedding-service:
-    # ─────────────────────────────────────
-    # VOLUME MOUNTING
-    # ─────────────────────────────────────
-    # Mount your local code directories into the container
-    # Any changes you make to .py files will be reflected immediately
-    # No need to rebuild the Docker image!
+  rag-service:
     volumes:
-      - ./service:/app/service        # FastAPI application code
-      - ./client:/app/client          # Client library code
-      - ./tests:/app/tests            # Test files for running pytest
-      - ./pyproject.toml:/app/pyproject.toml  # Package configuration
-      - embedding_logs:/app/logs      # Log files (persistent)
-
-    # ─────────────────────────────────────
-    # DEVELOPMENT LOGGING
-    # ─────────────────────────────────────
-    # Ensure development environment is set
+      - ./service:/app/service
+      - ./client:/app/client
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml
+      - rag_logs:/app/logs
+      - hf_cache:/app/.cache/huggingface
     environment:
-      - ENVIRONMENT=development
-      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
-
-    # ─────────────────────────────────────
-    # HOT-RELOAD ENABLED WITH EDITABLE INSTALL
-    # ─────────────────────────────────────
-    # Install package in editable mode with dev dependencies (pip install -e ".[dev]")
-    # This includes pytest and other dev tools for testing
-    # This makes imports work properly: "from client import EmbeddingClient"
-    # FastAPI will automatically restart when it detects code changes
-    # You'll see "Reloading..." in the logs when you save a file
+      ENVIRONMENT: development
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
     command: sh -c "pip install -e '.[dev]' && python -m uvicorn service.main:app --host 0.0.0.0 --port 8000 --reload"
-
-    # ─────────────────────────────────────
-    # NO AUTO-RESTART
-    # ─────────────────────────────────────
-    # In dev, we don't want Docker to auto-restart the container
-    # We want to see errors clearly and control when to restart
     restart: "no"
-
-    # ─────────────────────────────────────
-    # BUILD SETTINGS (Optional but useful)
-    # ─────────────────────────────────────
-    # Even though we mount volumes, we still need to build once
-    # to install dependencies. This ensures we don't use cache
-    # when dependencies change.
-    build:
-      context: .
-      dockerfile: Dockerfile
-      # Note: In dev, you typically build once, then volumes take over

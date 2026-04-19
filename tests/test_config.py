@@ -1,79 +1,42 @@
-"""
-Tests for configuration validation.
+"""Unit tests for configuration validation."""
 
-Catches missing env vars before deployment.
-"""
+from __future__ import annotations
+
+import importlib
+import os
 
 import pytest
-import os
-from service.config import Settings
 
 
-class TestConfigValidation:
-    """Test configuration validation."""
+def _reload_config(env: dict[str, str]):
+    """Reload service.config with a clean env snapshot."""
+    for k in list(os.environ):
+        if k.startswith(("WEAVIATE_", "EMBEDDER_", "GEMINI_", "API_KEY", "ENVIRONMENT", "EMBEDDING_")):
+            os.environ.pop(k, None)
+    os.environ.update(env)
+    from service import config
 
-    def test_valid_config(self, monkeypatch):
-        """Valid config should pass validation."""
-        # Set valid environment variables
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
-        monkeypatch.setenv("EMBEDDING_DIMENSION", "768")
-        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+    return importlib.reload(config)
 
-        # Create new settings object with monkeypatched env vars
-        settings = Settings()
 
-        # Validate should pass
-        assert settings.gemini_api_key == "test-key-123"
-        assert settings.embedding_dimension == 768
-        assert settings.qdrant_url == "http://localhost:6333"
+def test_defaults_are_valid_in_dev():
+    cfg = _reload_config({"ENVIRONMENT": "development"})
+    cfg.validate_settings()  # should not raise
 
-    # def test_missing_gemini_api_key(self, monkeypatch):
-    #     """Missing API key should raise error."""
-    #     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    #     monkeypatch.setenv("EMBEDDING_DIMENSION", "768")
-    #     monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
 
-    #     # Create settings with missing API key
-    #     settings = Settings()
+def test_production_requires_api_key():
+    cfg = _reload_config({"ENVIRONMENT": "production"})
+    with pytest.raises(ValueError, match="API_KEY"):
+        cfg.validate_settings()
 
-    #     # Validation should fail
-    #     assert not settings.gemini_api_key or settings.gemini_api_key == ""
 
-    def test_invalid_embedding_dimension(self, monkeypatch):
-        """Invalid dimension should raise error."""
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setenv("EMBEDDING_DIMENSION", "999")  # Invalid!
-        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+def test_gemini_backend_requires_api_key():
+    cfg = _reload_config({"EMBEDDER_BACKEND": "gemini"})
+    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+        cfg.validate_settings()
 
-        # Create settings with invalid dimension
-        settings = Settings()
 
-        # Should have the invalid dimension
-        assert settings.embedding_dimension == 999
-
-        # Validation function should reject it
-        valid_dimensions = [768, 1536, 3072]
-        assert settings.embedding_dimension not in valid_dimensions
-
-    def test_valid_embedding_dimensions(self, monkeypatch):
-        """Valid dimensions (768, 1536, 3072) should pass."""
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
-
-        valid_dimensions = [768, 1536, 3072]
-        for dimension in ["768", "1536", "3072"]:
-            monkeypatch.setenv("EMBEDDING_DIMENSION", dimension)
-            settings = Settings()
-            assert settings.embedding_dimension in valid_dimensions
-
-    # def test_missing_qdrant_url(self, monkeypatch):
-    #     """Missing Qdrant URL should raise error."""
-    #     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    #     monkeypatch.setenv("EMBEDDING_DIMENSION", "768")
-    #     monkeypatch.delenv("QDRANT_URL", raising=False)
-
-    #     # Create settings with missing Qdrant URL
-    #     settings = Settings()
-
-    #     # Should be empty or default
-    #     assert not settings.qdrant_url or settings.qdrant_url == "http://localhost:6333"
+def test_unknown_backend_rejected():
+    cfg = _reload_config({"EMBEDDER_BACKEND": "pinecone"})
+    with pytest.raises(ValueError, match="EMBEDDER_BACKEND"):
+        cfg.validate_settings()

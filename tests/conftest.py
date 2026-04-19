@@ -1,34 +1,42 @@
+"""Shared test fixtures.
+
+Integration tests are opt-in via RUN_INTEGRATION=1 so CI can decide
+whether to spin up a Weaviate container. Unit tests always run.
 """
-Test configuration and shared fixtures.
-"""
+
+from __future__ import annotations
+
+import os
 
 import pytest
 
 
-@pytest.fixture
-def sample_short_text():
-    """Short text for testing (< 500 tokens)."""
-    return "This is a short piece of text for testing."
+def pytest_collection_modifyitems(config, items):
+    """Skip integration tests unless RUN_INTEGRATION=1."""
+    if os.getenv("RUN_INTEGRATION") == "1":
+        return
+    skip = pytest.mark.skip(reason="set RUN_INTEGRATION=1 to run")
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip)
 
 
 @pytest.fixture
-def sample_medium_text():
-    """Medium text for testing (500-1500 tokens)."""
-    paragraph = """
-    Machine learning is a subset of artificial intelligence that enables systems to learn
-    and improve from experience without being explicitly programmed. It focuses on the
-    development of computer programs that can access data and use it to learn for themselves.
-    The process of learning begins with observations or data, such as examples, direct
-    experience, or instruction, in order to look for patterns in data and make better
-    decisions in the future based on the examples that we provide.
-    """
-    # Repeat to get ~700 tokens
-    return (paragraph + "\n\n") * 15
-
-
-@pytest.fixture
-def sample_large_text():
-    """Large text for testing (> 1500 tokens)."""
-    sentence = "This is a sentence in a very long document. "
-    # Repeat to get ~2000 tokens
-    return sentence * 400
+def sample_docs() -> list[dict]:
+    return [
+        {
+            "url": "https://example.com/a",
+            "text": "The refund policy allows returns within 30 days.",
+            "meta": {"rating": 5, "author": "Ada"},
+        },
+        {
+            "url": "https://example.com/b",
+            "text": "Product SKU-7741 shipped with damaged packaging.",
+            "meta": {"rating": 2, "author": "Ben"},
+        },
+        {
+            "url": "https://example.com/c",
+            "text": "Fantastic customer service team resolved the issue quickly.",
+            "meta": {"rating": 5, "author": "Cal"},
+        },
+    ]

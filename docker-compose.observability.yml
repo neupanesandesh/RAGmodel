@@ -1,0 +1,53 @@
+# Optional observability stack overlay. Adds Prometheus and Grafana and
+# wires them to the service's /metrics endpoint.
+#
+# Usage (alongside the base stack):
+#   docker compose -f docker-compose.yml \
+#     -f docker-compose.dev.yml \
+#     -f docker-compose.observability.yml up
+#
+# Grafana:    http://localhost:3000  (admin / admin, first-run asks to change)
+# Prometheus: http://localhost:9090
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: rag-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - rag-network
+    depends_on:
+      - rag-service
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: rag-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - rag-network
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:

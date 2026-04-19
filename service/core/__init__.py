@@ -1,9 +1,13 @@
-"""
-Core modules for the embedding service.
-"""
+"""Core modules: embedder backends and the Weaviate store."""
 
-from .chunking import chunk_text
-from .embedder import GeminiEmbedder
-from .vectorstore import QdrantStore
+from .embedder import Embedder, GeminiEmbedder, SentenceTransformerEmbedder, build_embedder
+from .weaviate_store import SearchHit, WeaviateStore
 
-__all__ = ["chunk_text", "GeminiEmbedder", "QdrantStore"]
+__all__ = [
+    "Embedder",
+    "GeminiEmbedder",
+    "SentenceTransformerEmbedder",
+    "build_embedder",
+    "SearchHit",
+    "WeaviateStore",
+]

@@ -1,10 +1,6 @@
-"""
-Embedding Service Client
+"""Python client for the Weaviate-backed RAG service."""
 
-A simple Python client for the Embedding Service.
-"""
+from .client import RAGClient, SearchHit
 
-from .client import EmbeddingClient, SearchResult, create_client
-
-__version__ = "1.0.0"
-__all__ = ["EmbeddingClient", "SearchResult", "create_client"]
+__version__ = "2.0.0"
+__all__ = ["RAGClient", "SearchHit"]

@@ -1,42 +1,87 @@
-"""
-FastAPI Embedding Service
+"""FastAPI entrypoint for the Weaviate-backed RAG service."""
 
-Main application that exposes REST API endpoints for embedding operations.
-"""
+from __future__ import annotations
 
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, status, Request
+from typing import Any, Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from contextlib import asynccontextmanager
-import time
-import json
-from service.config import settings, validate_settings
-from service.logging_config import setup_logging, get_component_logger, get_request_logger, get_performance_logger
-from service.models import (
-    CollectionCreate, CollectionResponse, CollectionList,
-    DocumentDelete, DocumentDeleteResponse,
-    SimpleDocument, BatchDocumentAdd, BatchDocumentAddResponse,
-    SearchRequest, SearchResponse, SearchResult, SearchResultMetadata,
-    HealthResponse, ErrorResponse
-)
-from service.core.embedder import GeminiEmbedder
-from service.core.vectorstore import QdrantStore
+from fastapi.security import APIKeyHeader
+from prometheus_fastapi_instrumentator import Instrumentator
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from starlette.responses import JSONResponse
 
-# Initialize logger for main module
+from service.config import settings, validate_settings
+from service.core.embedder import Embedder, build_embedder
+from service.core.weaviate_store import WeaviateStore
+from service.logging_config import (
+    get_component_logger,
+    get_performance_logger,
+    get_request_logger,
+    setup_logging,
+)
+from service.models import (
+    BatchUploadRequest,
+    BatchUploadResponse,
+    DatasetDeleteResponse,
+    DatasetList,
+    GenerateRequest,
+    GenerateResponse,
+    HealthResponse,
+    HybridSearchRequest,
+    SearchHitOut,
+    SearchResponse,
+    TenantCreate,
+    TenantInfo,
+    TenantList,
+)
+
 logger = get_component_logger("main")
 
+# ---------------------------------------------------------------------------
+# Auth + rate limiting
+# ---------------------------------------------------------------------------
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Global instances (initialized on startup)
-embedder = None
-vector_store = None
+
+def require_api_key(key: str | None = Depends(_api_key_header)) -> None:
+    expected = settings.api_key
+    if not expected:
+        # No API_KEY configured → auth disabled. In production startup
+        # validation refuses to boot without one, so this branch only
+        # runs in dev.
+        return
+    if key != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key header",
+        )
+
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[f"{settings.rate_limit_per_minute}/minute"],
+)
+
+
+# ---------------------------------------------------------------------------
+# App singletons
+# ---------------------------------------------------------------------------
+store: WeaviateStore | None = None
+embedder: Embedder | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedder, vector_store
+    global store, embedder
 
-    # Setup logging first
     setup_logging(
         environment=settings.environment,
         log_level=settings.log_level,
@@ -45,727 +90,514 @@ async def lifespan(app: FastAPI):
         rotation_size=settings.log_rotation_size,
     )
 
-    logger.info("="*50)
-    logger.info("Starting Embedding Service")
-    logger.info("="*50)
+    logger.info("Starting RAG service")
+    validate_settings()
 
-    # Validate configuration
+    embedder = build_embedder(
+        backend=settings.embedder_backend,
+        model_name=settings.st_model,
+        api_key=settings.gemini_api_key,
+        model=settings.gemini_embedding_model,
+        dimensions=settings.embedding_dimension,
+    )
+
+    store = WeaviateStore(
+        host=settings.weaviate_host,
+        http_port=settings.weaviate_http_port,
+        grpc_port=settings.weaviate_grpc_port,
+        collection=settings.weaviate_collection,
+        api_key=settings.weaviate_api_key,
+    )
+    store.ensure_schema(vector_size=embedder.dimensions)
+
+    logger.success(
+        "Service ready",
+        extra={
+            "embedder": settings.embedder_backend,
+            "dimensions": embedder.dimensions,
+            "collection": settings.weaviate_collection,
+            "port": settings.service_port,
+        },
+    )
+
     try:
-        validate_settings()
-        logger.success("Configuration validated successfully")
-    except ValueError as e:
-        logger.error(f"Startup Failed - Configuration validation error: {e}")
-        raise
-
-    # Initialize services
-    try:
-        if settings.gemini_api_key:
-            embedder = GeminiEmbedder(
-                api_key=settings.gemini_api_key,
-                model=settings.gemini_model,
-                dimensions=settings.embedding_dimension
-            )
-            logger.success(
-                "Gemini embedder initialized",
-                extra={"model": settings.gemini_model, "dimensions": settings.embedding_dimension}
-            )
-        else:
-            logger.warning("Gemini API key not set - embedder unavailable, search/upload disabled")
-
-        vector_store = QdrantStore(
-            url=settings.qdrant_url,
-            # api_key=settings.qdrant_api_key
-        )
-        logger.success("Qdrant vector store connected", extra={"url": settings.qdrant_url})
-
-    except Exception as e:
-        logger.exception(f"Failed to initialize services: {e}")
-        raise
-
-    logger.success("Service ready and listening", extra={
-        "host": settings.service_host,
-        "port": settings.service_port,
-        "environment": settings.environment
-    })
-    logger.info("="*50)
-
-    yield
-
-    logger.info("Shutting down gracefully")
+        yield
+    finally:
+        logger.info("Shutting down")
+        if store is not None:
+            store.close()
 
 
-# Create FastAPI app
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Embedding Service",
-    description="RAG service",
-    version="1.0.0",
-    lifespan=lifespan
+    title="RAG Embedding Service (Weaviate)",
+    description=(
+        "Multi-tenant hybrid-search RAG microservice backed by Weaviate. "
+        "Tenant-per-company, typed schema, BM25+vector hybrid, "
+        "bring-your-own-vectors."
+    ),
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
-# Add CORS middleware
+# CORS: strict by default; override via CORS_ALLOWED_ORIGINS env.
+_raw_origins = settings.cors_allowed_origins.strip()
+_allowed_origins = (
+    [o.strip() for o in _raw_origins.split(",") if o.strip()]
+    if _raw_origins
+    else []
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_allowed_origins,
+    allow_credentials=bool(_allowed_origins),
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
+
+# Rate limiting
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": f"Rate limit exceeded: {exc.detail}"},
+    )
+
+
+# Prometheus metrics — exposes /metrics with request/error/duration histograms.
+if settings.enable_metrics:
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 # Request logging middleware
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """
-    Middleware to log all HTTP requests and responses.
-    """
-    request_logger = get_request_logger()
-    start_time = time.time()
-
-    # Log incoming request
-    request_logger.info(
-        f"{request.method} {request.url.path}",
+async def _log_requests(request: Request, call_next):
+    req_logger = get_request_logger()
+    start = time.time()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = round((time.time() - start) * 1000, 2)
+        req_logger.exception(
+            f"{request.method} {request.url.path} — UNCAUGHT",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": elapsed_ms,
+            },
+        )
+        raise
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+    req_logger.info(
+        f"{request.method} {request.url.path} {response.status_code}",
         extra={
             "method": request.method,
             "path": request.url.path,
-            "query_params": str(request.query_params),
-            "client_ip": request.client.host if request.client else "unknown",
-            "user_agent": request.headers.get("user-agent", "unknown"),
-        }
+            "status": response.status_code,
+            "duration_ms": elapsed_ms,
+        },
     )
-
-    # Process request
-    try:
-        response = await call_next(request)
-        process_time = time.time() - start_time
-
-        # Log response
-        request_logger.info(
-            f"{request.method} {request.url.path} - {response.status_code}",
-            extra={
-                "method": request.method,
-                "path": request.url.path,
-                "status_code": response.status_code,
-                "process_time_ms": round(process_time * 1000, 2),
-            }
-        )
-
-        # Add custom header with process time
-        response.headers["X-Process-Time"] = str(round(process_time * 1000, 2))
-        return response
-
-    except Exception as e:
-        process_time = time.time() - start_time
-        request_logger.error(
-            f"{request.method} {request.url.path} - ERROR",
-            extra={
-                "method": request.method,
-                "path": request.url.path,
-                "error": str(e),
-                "process_time_ms": round(process_time * 1000, 2),
-            }
-        )
-        raise
+    response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
+    return response
 
 
-# Health Check Endpoint
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """
-    Health check endpoint to verify service status.
-    """
+# ---------------------------------------------------------------------------
+# Public endpoints (no auth)
+# ---------------------------------------------------------------------------
+@app.get("/health", response_model=HealthResponse, tags=["meta"])
+async def health() -> HealthResponse:
     return HealthResponse(
-        status="healthy",
-        gemini_configured=bool(settings.gemini_api_key),
-        qdrant_configured=bool(settings.qdrant_url)
+        status="ok",
+        weaviate_ready=bool(store and store.is_ready()),
+        embedder_backend=settings.embedder_backend,
+        embedding_dimension=embedder.dimensions if embedder else 0,
     )
 
 
-# Collection Endpoints
-@app.post("/collections", response_model=dict, status_code=status.HTTP_201_CREATED)
-async def create_collection(request: CollectionCreate):
-    try:
-        vector_store.create_collection(
-            collection_name=request.name,
-            vector_size=settings.embedding_dimension
-        )
-        logger.info(
-            f"Collection created: {request.name}",
-            extra={"collection_name": request.name, "vector_size": settings.embedding_dimension}
-        )
-        return {
-            "message": f"Collection '{request.name}' created successfully",
-            "name": request.name,
-            "vector_size": settings.embedding_dimension
-        }
-    except Exception as e:
-        logger.error(
-            f"Failed to create collection: {request.name}",
-            extra={"collection_name": request.name, "error": str(e)}
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-
-
-@app.get("/collections", response_model=CollectionList)
-async def list_collections():
-    """
-    List all available collections.
-    """
-    try:
-        collections = vector_store.list_collections()
-        return CollectionList(collections=collections)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
-
-
-@app.get("/collections/{collection_name}", response_model=CollectionResponse)
-async def get_collection_info(collection_name: str):
-    """
-    Get information about a specific collection.
-    """
-    try:
-        info = vector_store.get_collection_info(collection_name)
-        return CollectionResponse(**info)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
-
-
-@app.get("/collections/{collection_name}/datasets")
-async def list_datasets(collection_name: str):
-    """
-    List all dataset IDs in a collection.
-
-    Useful for verifying uploads and checking what datasets exist.
-
-    Returns:
-        List of dataset_ids
-    """
-    try:
-        datasets = vector_store.list_datasets(collection_name)
-        return {
-            "collection": collection_name,
-            "datasets": datasets,
-            "count": len(datasets)
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
-
-
-@app.delete("/collections/{collection_name}")
-async def delete_collection(collection_name: str):
-    """
-    Delete a collection and all its documents.
-    """
-    try:
-        vector_store.delete_collection(collection_name)
-        logger.warning(
-            f"Collection deleted: {collection_name}",
-            extra={"collection_name": collection_name}
-        )
-        return {"message": f"Collection '{collection_name}' deleted successfully"}
-    except Exception as e:
-        # Return 404 if collection doesn't exist, 400 for other errors
-        error_msg = str(e)
-        logger.error(
-            f"Failed to delete collection: {collection_name}",
-            extra={"collection_name": collection_name, "error": error_msg}
-        )
-        if "does not exist" in error_msg:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=error_msg
-            )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=error_msg
-        )
-
-@app.post("/collections/{collection_name}/documents/batch/{dataset_id}", response_model=BatchDocumentAddResponse)
-async def add_documents_batch(
-    collection_name: str,
-    dataset_id: str,
-    request: BatchDocumentAdd
-):
-    """
-    Add multiple preprocessed documents in batch (simple format).
-
-    Each document should be in format: {url, text, meta}
-    - One document = one chunk (no auto-chunking)
-    - Each chunk stores its own url and metadata
-    - Perfect for preprocessed reviews, products, Q&A, etc.
-
-    Args:
-        collection_name: Name of the collection
-        dataset_id: Unique identifier for this dataset
-        request: Batch upload request with list of documents
-
-    Example:
-        POST /collections/auditcity/documents/batch/lavon-family-dental
-        {
-          "documents": [
-            {
-              "url": "https://review1.com",
-              "text": "Great service!",
-              "meta": {"rating": 5, "author": "John"}
-            },
-            {
-              "url": "https://review2.com",
-              "text": "Not satisfied",
-              "meta": {"rating": 2, "author": "Jane"}
-            }
-          ]
-        }
-    """
-    if not embedder:
-        raise HTTPException(status_code=503, detail="Embedder not configured - set GEMINI_API_KEY to enable uploads")
-
-    start_time = time.time()
-    perf_logger = get_performance_logger()
-
-    try:
-        if not request.documents:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No documents provided"
-            )
-
-        logger.info(
-            f"[1/3] Processing {len(request.documents)} documents...",
-            extra={"dataset_id": dataset_id, "documents_count": len(request.documents)}
-        )
-
-        # Process each document
-        texts = []
-        metadatas = []
-        warnings = []
-        skipped_count = 0
-
-        for idx, doc in enumerate(request.documents):
-            # Validate text
-            if not doc.text or not doc.text.strip():
-                warning = f"Document {idx}: Empty text, skipping"
-                warnings.append(warning)
-                skipped_count += 1
-                continue
-
-            # Build metadata with url
-            metadata = {"url": doc.url}
-
-            # Add optional meta fields
-            if doc.meta:
-                metadata.update(doc.meta)
-
-            texts.append(doc.text)
-            metadatas.append(metadata)
-
-        if not texts:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"No valid documents found. All {len(request.documents)} documents skipped."
-            )
-
-        logger.success(
-            f"✓ Processed {len(texts)} valid documents ({skipped_count} skipped)",
-            extra={
-                "dataset_id": dataset_id,
-                "valid_documents": len(texts),
-                "skipped_documents": skipped_count
-            }
-        )
-
-        # Log warnings if any
-        if warnings:
-            for warning in warnings[:10]:
-                logger.warning(warning, extra={"dataset_id": dataset_id})
-            if len(warnings) > 10:
-                logger.warning(
-                    f"... and {len(warnings) - 10} more warnings",
-                    extra={"dataset_id": dataset_id}
-                )
-
-        # Step 2: Generate embeddings
-        logger.info(
-            f"[2/3] Embedding {len(texts)} documents (this may take several minutes)...",
-            extra={"dataset_id": dataset_id, "texts_count": len(texts)}
-        )
-        embed_start = time.time()
-        embeddings = embedder.embed_batch(texts, task_type="RETRIEVAL_DOCUMENT")
-        embed_time = time.time() - embed_start
-
-        logger.success(
-            f"✓ Embedding complete: {len(texts)} documents embedded in {embed_time:.1f}s",
-            extra={"dataset_id": dataset_id, "embedding_time_seconds": round(embed_time, 2)}
-        )
-
-        # Step 3: Store in Qdrant
-        logger.info(
-            f"[3/3] Storing {len(texts)} documents to Qdrant...",
-            extra={"dataset_id": dataset_id, "collection": collection_name}
-        )
-        store_start = time.time()
-
-        # Store each document as a chunk with its metadata
-        chunks_stored = 0
-        for idx, (text, embedding, metadata) in enumerate(zip(texts, embeddings, metadatas)):
-            # Create a single "chunk" tuple for this document
-            chunks = [(text, idx)]
-
-            # Store with its specific metadata
-            stored = vector_store.add_document(
-                collection_name=collection_name,
-                doc_id=f"{dataset_id}_doc_{idx}",
-                chunks=chunks,
-                embeddings=[embedding],
-                dataset_id=dataset_id,
-                metadata=metadata
-            )
-            chunks_stored += stored
-
-        store_time = time.time() - store_start
-
-        logger.success(
-            f"✓ Storage complete: {chunks_stored} documents stored in {store_time:.1f}s",
-            extra={"dataset_id": dataset_id, "chunks_stored": chunks_stored, "storage_time_seconds": round(store_time, 2)}
-        )
-
-        total_time = time.time() - start_time
-
-        # Log performance metrics
-        perf_extra = {
-            "operation": "add_documents_batch",
-            "collection": collection_name,
-            "dataset_id": dataset_id,
-            "documents_processed": len(texts),
-            "documents_skipped": skipped_count,
-            "chunks_stored": chunks_stored,
-            "timing": {
-                "total_ms": round(total_time * 1000, 2),
-                "embedding_ms": round(embed_time * 1000, 2),
-                "storage_ms": round(store_time * 1000, 2),
-            }
-        }
-
-        perf_logger.info(
-            f"Batch documents added: {dataset_id}",
-            extra=perf_extra
-        )
-
-        logger.success(
-            f"✓✓✓ UPLOAD COMPLETE: {dataset_id} → {chunks_stored} documents in {total_time:.1f}s total",
-            extra={
-                "dataset_id": dataset_id,
-                "collection": collection_name,
-                "documents": chunks_stored,
-                "skipped": skipped_count,
-                "total_time_seconds": round(total_time, 2)
-            }
-        )
-
-        return BatchDocumentAddResponse(
-            dataset_id=dataset_id,
-            documents_processed=len(texts),
-            chunks_stored=chunks_stored,
-            documents_skipped=skipped_count,
-            warnings=warnings,
-            message=f"Successfully uploaded {chunks_stored} documents ({skipped_count} skipped)"
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(
-            f"Failed to add batch documents {dataset_id} to {collection_name}: {str(e)}",
-            extra={"dataset_id": dataset_id, "collection": collection_name}
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to add batch documents: {str(e)}"
-        )
-
-
-@app.delete("/collections/{collection_name}/documents/{dataset_id}")
-async def delete_document(collection_name: str, dataset_id: str):
-    """
-    Delete a document/dataset and all its chunks from a collection.
-    """
-    try:
-        vector_store.delete_document(collection_name, dataset_id)
-        logger.warning(
-            f"Document deleted from {collection_name}: {dataset_id}",
-            extra={"collection": collection_name, "dataset_id": dataset_id}
-        )
-        return {
-            "message": f"Document '{dataset_id}' deleted successfully",
-            "dataset_id": dataset_id
-        }
-    except Exception as e:
-        # Return 404 if collection/document doesn't exist, 400 for other errors
-        error_msg = str(e)
-        logger.error(
-            f"Failed to delete document {dataset_id} from {collection_name}",
-            extra={"collection": collection_name, "dataset_id": dataset_id, "error": error_msg}
-        )
-        if "does not exist" in error_msg:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=error_msg
-            )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=error_msg
-        )
-
-
-# Search Endpoints
-
-# 1. Search within entire collection (all datasets)
-@app.post("/collections/{collection_name}/search", response_model=SearchResponse)
-async def search_collection(
-    collection_name: str,
-    request: SearchRequest,
-    k: int = 5
-):
-    """
-    Search for similar documents across entire collection (all datasets).
-
-    Args:
-        collection_name: Collection to search in (e.g., 'auditcity')
-        request: Search request body with query and optional filters
-        k: Number of results to return (default: 5)
-
-    Example:
-        POST /collections/auditcity/search?k=10
-        Body: {"query": "great service", "filters": {"doc_type": "reviews"}}
-    """
-    if not embedder:
-        raise HTTPException(status_code=503, detail="Embedder not configured - set GEMINI_API_KEY to enable search")
-
-    start_time = time.time()
-    perf_logger = get_performance_logger()
-
-    try:
-        # Step 1: Embed the search query
-        embed_start = time.time()
-        query_vector = embedder.embed_for_search(request.query)
-        embed_time = time.time() - embed_start
-
-        # Step 2: Search in Qdrant (dataset_id=None searches entire collection)
-        search_start = time.time()
-        results = vector_store.search(
-            collection_name=collection_name,
-            query_vector=query_vector,
-            dataset_id=None,  # Search all datasets
-            k=k,
-            filters=request.filters
-        )
-        search_time = time.time() - search_start
-
-        # Step 3: Format results
-        formatted_results = [
-            SearchResult(
-                score=r["score"],
-                text=r["text"],
-                metadata=SearchResultMetadata(**r["metadata"])
-            )
-            for r in results
-        ]
-
-        total_time = time.time() - start_time
-
-        # Log performance metrics
-        perf_logger.info(
-            f"Search completed in entire collection: {request.query[:50]}...",
-            extra={
-                "operation": "search_collection",
-                "collection": collection_name,
-                "dataset_id": None,
-                "search_scope": "entire_collection",
-                "filters": request.filters,
-                "query_length": len(request.query),
-                "k": k,
-                "results_count": len(formatted_results),
-                "timing": {
-                    "total_ms": round(total_time * 1000, 2),
-                    "embedding_ms": round(embed_time * 1000, 2),
-                    "search_ms": round(search_time * 1000, 2),
-                }
-            }
-        )
-
-        logger.info(
-            f"Search in {collection_name} (all datasets) returned {len(formatted_results)} results",
-            extra={"collection": collection_name, "dataset_id": None, "results": len(formatted_results)}
-        )
-
-        return SearchResponse(
-            query=request.query,
-            results=formatted_results,
-            count=len(formatted_results)
-        )
-
-    except Exception as e:
-        logger.exception(
-            f"Search failed in {collection_name}: {str(e)}",
-            extra={"collection": collection_name, "query": request.query[:100]}
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Search failed: {str(e)}"
-        )
-
-
-# 2. Search within specific dataset
-@app.post("/collections/{collection_name}/{dataset_id}/search", response_model=SearchResponse)
-async def search_dataset(
-    collection_name: str,
-    dataset_id: str,
-    request: SearchRequest,
-    k: int = 5
-):
-    """
-    Search for similar documents in a specific dataset.
-
-    Args:
-        collection_name: Collection to search in (e.g., 'auditcity')
-        dataset_id: Dataset identifier to search within (e.g., 'dallas-dentist')
-        request: Search request body with query and optional filters
-        k: Number of results to return (default: 5)
-
-    Example:
-        POST /collections/auditcity/dallas-dentist/search?k=10
-        Body: {"query": "great service", "filters": {"doc_type": "reviews"}}
-    """
-    if not embedder:
-        raise HTTPException(status_code=503, detail="Embedder not configured - set GEMINI_API_KEY to enable search")
-
-    start_time = time.time()
-    perf_logger = get_performance_logger()
-
-    try:
-        # Step 1: Embed the search query
-        embed_start = time.time()
-        query_vector = embedder.embed_for_search(request.query)
-        embed_time = time.time() - embed_start
-
-        # Step 2: Search in Qdrant
-        search_start = time.time()
-        results = vector_store.search(
-            collection_name=collection_name,
-            query_vector=query_vector,
-            dataset_id=dataset_id,
-            k=k,
-            filters=request.filters
-        )
-        search_time = time.time() - search_start
-
-        # Step 3: Format results
-        formatted_results = [
-            SearchResult(
-                score=r["score"],
-                text=r["text"],
-                metadata=SearchResultMetadata(**r["metadata"])
-            )
-            for r in results
-        ]
-
-        total_time = time.time() - start_time
-
-        # Log performance metrics
-        perf_logger.info(
-            f"Search completed in dataset '{dataset_id}': {request.query[:50]}...",
-            extra={
-                "operation": "search_dataset",
-                "collection": collection_name,
-                "dataset_id": dataset_id,
-                "search_scope": f"dataset:{dataset_id}",
-                "filters": request.filters,
-                "query_length": len(request.query),
-                "k": k,
-                "results_count": len(formatted_results),
-                "timing": {
-                    "total_ms": round(total_time * 1000, 2),
-                    "embedding_ms": round(embed_time * 1000, 2),
-                    "search_ms": round(search_time * 1000, 2),
-                }
-            }
-        )
-
-        logger.info(
-            f"Search in {collection_name}/{dataset_id} returned {len(formatted_results)} results",
-            extra={"collection": collection_name, "dataset_id": dataset_id, "results": len(formatted_results)}
-        )
-
-        return SearchResponse(
-            query=request.query,
-            results=formatted_results,
-            count=len(formatted_results)
-        )
-
-    except Exception as e:
-        logger.exception(
-            f"Search failed in {collection_name}/{dataset_id}: {str(e)}",
-            extra={"collection": collection_name, "dataset_id": dataset_id, "query": request.query[:100]}
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Search failed: {str(e)}"
-        )
-
-
-# Static files and UI
 STATIC_DIR = Path(__file__).parent / "static"
 
 
 @app.get("/", include_in_schema=False, response_class=HTMLResponse)
 async def root():
-    """Serve the web UI."""
-    html_file = STATIC_DIR / "index.html"
-    return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
+    index = STATIC_DIR / "index.html"
+    if not index.exists():
+        return HTMLResponse("<h1>RAG service running</h1><p>See /docs</p>")
+    return HTMLResponse(index.read_text(encoding="utf-8"))
 
 
-@app.get("/api")
-async def api_info():
-    """
-    API info endpoint with service information.
-    """
-    return {
-        "service": "Embedding Service",
-        "version": "1.0.0",
-        "status": "running",
-        "docs": "/docs"
-    }
+# ---------------------------------------------------------------------------
+# Tenants
+# ---------------------------------------------------------------------------
+@app.post(
+    "/tenants",
+    response_model=TenantInfo,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_api_key)],
+    tags=["tenants"],
+)
+async def create_tenant(body: TenantCreate) -> TenantInfo:
+    _require_store().create_tenant(body.name)
+    return TenantInfo(
+        tenant=body.name,
+        collection=settings.weaviate_collection,
+        object_count=0,
+    )
 
 
-def run_service():
+@app.get(
+    "/tenants",
+    response_model=TenantList,
+    dependencies=[Depends(require_api_key)],
+    tags=["tenants"],
+)
+async def list_tenants() -> TenantList:
+    tenants = _require_store().list_tenants()
+    return TenantList(tenants=tenants, count=len(tenants))
+
+
+@app.get(
+    "/tenants/{tenant}",
+    response_model=TenantInfo,
+    dependencies=[Depends(require_api_key)],
+    tags=["tenants"],
+)
+async def get_tenant(tenant: str) -> TenantInfo:
+    s = _require_store()
+    if not s.tenant_exists(tenant):
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant}' not found")
+    stats = s.tenant_stats(tenant)
+    return TenantInfo(
+        tenant=stats["tenant"],
+        collection=stats["collection"],
+        object_count=stats["object_count"],
+    )
+
+
+@app.delete(
+    "/tenants/{tenant}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_api_key)],
+    tags=["tenants"],
+)
+async def delete_tenant(tenant: str) -> None:
+    s = _require_store()
+    if not s.tenant_exists(tenant):
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant}' not found")
+    s.delete_tenant(tenant)
+
+
+@app.get(
+    "/tenants/{tenant}/datasets",
+    response_model=DatasetList,
+    dependencies=[Depends(require_api_key)],
+    tags=["datasets"],
+)
+async def list_datasets(tenant: str) -> DatasetList:
+    s = _require_store()
+    if not s.tenant_exists(tenant):
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant}' not found")
+    datasets = s.list_datasets(tenant)
+    return DatasetList(tenant=tenant, datasets=datasets, count=len(datasets))
+
+
+# ---------------------------------------------------------------------------
+# Batch upload
+# ---------------------------------------------------------------------------
+@app.post(
+    "/tenants/{tenant}/datasets/{dataset_id}/objects/batch",
+    response_model=BatchUploadResponse,
+    dependencies=[Depends(require_api_key)],
+    tags=["ingest"],
+)
+async def upload_batch(
+    tenant: str, dataset_id: str, body: BatchUploadRequest
+) -> BatchUploadResponse:
+    s = _require_store()
+    e = _require_embedder()
+    perf = get_performance_logger()
+    t0 = time.time()
+
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    skipped = 0
+
+    for idx, doc in enumerate(body.documents):
+        if not doc.text or not doc.text.strip():
+            skipped += 1
+            warnings.append(f"doc[{idx}]: empty text skipped")
+            continue
+        row: dict[str, Any] = {"text": doc.text, "url": doc.url}
+        if doc.meta:
+            for k, v in doc.meta.items():
+                if k in {"text", "url"}:
+                    continue
+                row[k] = v
+        rows.append(row)
+
+    if not rows:
+        raise HTTPException(
+            status_code=400,
+            detail=f"All {len(body.documents)} document(s) were invalid",
+        )
+
+    t_embed = time.time()
+    texts = [r["text"] for r in rows]
+    vectors = e.embed_documents(texts)
+    embed_ms = round((time.time() - t_embed) * 1000, 2)
+
+    t_store = time.time()
+    inserted = s.upsert_batch(tenant=tenant, dataset_id=dataset_id, rows=rows, vectors=vectors)
+    store_ms = round((time.time() - t_store) * 1000, 2)
+
+    total_ms = round((time.time() - t0) * 1000, 2)
+    perf.info(
+        "batch_upload",
+        extra={
+            "tenant": tenant,
+            "dataset_id": dataset_id,
+            "inserted": inserted,
+            "skipped": skipped,
+            "embed_ms": embed_ms,
+            "store_ms": store_ms,
+            "total_ms": total_ms,
+        },
+    )
+
+    return BatchUploadResponse(
+        tenant=tenant,
+        dataset_id=dataset_id,
+        inserted=inserted,
+        skipped=skipped,
+        warnings=warnings[:20],
+        timing_ms={"embed": embed_ms, "store": store_ms, "total": total_ms},
+    )
+
+
+@app.delete(
+    "/tenants/{tenant}/datasets/{dataset_id}",
+    response_model=DatasetDeleteResponse,
+    dependencies=[Depends(require_api_key)],
+    tags=["datasets"],
+)
+async def delete_dataset(tenant: str, dataset_id: str) -> DatasetDeleteResponse:
+    s = _require_store()
+    if not s.tenant_exists(tenant):
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant}' not found")
+    deleted = s.delete_dataset(tenant, dataset_id)
+    return DatasetDeleteResponse(
+        tenant=tenant, dataset_id=dataset_id, objects_deleted=deleted
+    )
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+@app.post(
+    "/tenants/{tenant}/search",
+    response_model=SearchResponse,
+    dependencies=[Depends(require_api_key)],
+    tags=["search"],
+)
+async def search_tenant(tenant: str, body: HybridSearchRequest) -> SearchResponse:
+    return _run_hybrid(tenant=tenant, dataset_id=None, body=body)
+
+
+@app.post(
+    "/tenants/{tenant}/datasets/{dataset_id}/search",
+    response_model=SearchResponse,
+    dependencies=[Depends(require_api_key)],
+    tags=["search"],
+)
+async def search_dataset(
+    tenant: str, dataset_id: str, body: HybridSearchRequest
+) -> SearchResponse:
+    return _run_hybrid(tenant=tenant, dataset_id=dataset_id, body=body)
+
+
+# ---------------------------------------------------------------------------
+# Generative RAG (retrieval + Gemini generation)
+# ---------------------------------------------------------------------------
+@app.post(
+    "/tenants/{tenant}/generate",
+    response_model=GenerateResponse,
+    dependencies=[Depends(require_api_key)],
+    tags=["rag"],
+)
+async def generate(tenant: str, body: GenerateRequest) -> GenerateResponse:
+    """Retrieve top-k via hybrid search, then ask Gemini to answer grounded
+    in those passages. Requires ``GEMINI_API_KEY``; returns 503 otherwise.
     """
-    Entry point for console script.
-    Used when running: embedding-service
-    """
+    if not settings.gemini_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Generation disabled — set GEMINI_API_KEY to enable /generate",
+        )
+
+    s = _require_store()
+    e = _require_embedder()
+    t0 = time.time()
+
+    t_embed = time.time()
+    qvec = e.embed_query(body.query)
+    embed_ms = round((time.time() - t_embed) * 1000, 2)
+
+    t_search = time.time()
+    hits = s.hybrid_search(
+        tenant=tenant,
+        query_text=body.query,
+        query_vector=qvec,
+        dataset_id=body.dataset_id,
+        filters=body.filters,
+        limit=body.limit,
+        alpha=body.alpha,
+    )
+    search_ms = round((time.time() - t_search) * 1000, 2)
+
+    t_gen = time.time()
+    answer = _gemini_answer(query=body.query, passages=[h.text for h in hits])
+    gen_ms = round((time.time() - t_gen) * 1000, 2)
+
+    total_ms = round((time.time() - t0) * 1000, 2)
+    return GenerateResponse(
+        tenant=tenant,
+        query=body.query,
+        answer=answer,
+        sources=[_hit_to_out(h) for h in hits],
+        timing_ms={
+            "embed": embed_ms,
+            "search": search_ms,
+            "generate": gen_ms,
+            "total": total_ms,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _require_store() -> WeaviateStore:
+    if store is None:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+    return store
+
+
+def _require_embedder() -> Embedder:
+    if embedder is None:
+        raise HTTPException(status_code=503, detail="Embedder not initialized")
+    return embedder
+
+
+def _run_hybrid(
+    *, tenant: str, dataset_id: Optional[str], body: HybridSearchRequest
+) -> SearchResponse:
+    s = _require_store()
+    e = _require_embedder()
+    perf = get_performance_logger()
+    t0 = time.time()
+
+    t_embed = time.time()
+    qvec = e.embed_query(body.query)
+    embed_ms = round((time.time() - t_embed) * 1000, 2)
+
+    t_search = time.time()
+    hits = s.hybrid_search(
+        tenant=tenant,
+        query_text=body.query,
+        query_vector=qvec,
+        dataset_id=dataset_id,
+        filters=body.filters,
+        limit=body.limit,
+        alpha=body.alpha,
+    )
+    search_ms = round((time.time() - t_search) * 1000, 2)
+
+    total_ms = round((time.time() - t0) * 1000, 2)
+    perf.info(
+        "hybrid_search",
+        extra={
+            "tenant": tenant,
+            "dataset_id": dataset_id,
+            "alpha": body.alpha,
+            "limit": body.limit,
+            "results": len(hits),
+            "embed_ms": embed_ms,
+            "search_ms": search_ms,
+            "total_ms": total_ms,
+        },
+    )
+
+    return SearchResponse(
+        tenant=tenant,
+        dataset_id=dataset_id,
+        query=body.query,
+        alpha=body.alpha,
+        results=[_hit_to_out(h) for h in hits],
+        count=len(hits),
+        timing_ms={"embed": embed_ms, "search": search_ms, "total": total_ms},
+    )
+
+
+def _hit_to_out(h) -> SearchHitOut:
+    from service.models import SearchHitMetadata
+
+    return SearchHitOut(
+        object_id=h.object_id,
+        score=h.score,
+        text=h.text,
+        dataset_id=h.dataset_id,
+        chunk_index=h.chunk_index,
+        chunk_count=h.chunk_count,
+        created_at=h.created_at,
+        metadata=SearchHitMetadata(**(h.metadata or {})),
+        explain_score=h.explain_score,
+    )
+
+
+def _gemini_answer(query: str, passages: list[str]) -> str:
+    """Call Gemini to produce a grounded answer. Imports lazily."""
+    from google import genai
+
+    client = genai.Client(api_key=settings.gemini_api_key)
+    context = "\n\n---\n\n".join(f"[{i+1}] {p}" for i, p in enumerate(passages))
+    prompt = (
+        "You are a retrieval-grounded assistant. Answer the user question using "
+        "ONLY the numbered passages below. Cite passage numbers in square brackets. "
+        "If the passages do not contain the answer, say so.\n\n"
+        f"PASSAGES:\n{context}\n\nQUESTION: {query}\n\nANSWER:"
+    )
+    resp = client.models.generate_content(
+        model=settings.gemini_generative_model,
+        contents=prompt,
+    )
+    return (resp.text or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint
+# ---------------------------------------------------------------------------
+def run_service() -> None:
     import uvicorn
+
     uvicorn.run(
         "service.main:app",
         host=settings.service_host,
         port=settings.service_port,
-        reload=False
+        reload=False,
     )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
-        app,  # Use app directly when running as script
+        "service.main:app",
         host=settings.service_host,
         port=settings.service_port,
-        reload=True  # Enable auto-reload during development
+        reload=True,
     )

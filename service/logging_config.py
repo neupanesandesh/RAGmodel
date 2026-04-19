@@ -1,267 +1,161 @@
-"""
-Centralized logging configuration using Loguru.
+"""Logging setup: one stream, one format, shipper-friendly.
 
-This module configures structured logging for the RAGmodel microservice with:
-- Environment-aware configuration (development vs production)
-- Categorized log files (app, errors, requests, performance)
-- Automatic log rotation and retention
-- JSON formatting for production (easy parsing)
-- Colored console output for development
+Design:
+  * Single structured output. In production, that is JSON on stdout —
+    trivial to ship to Datadog, Loki, CloudWatch, or Elastic without
+    parsing. In development, that is a colorized single-line format on
+    stdout for humans.
+  * One optional rolling file sink (same JSON) so self-hosted deployments
+    have a local audit trail without a log pipeline.
+  * No per-category file split. Filtering by ``component`` /
+    ``category`` / ``event`` happens downstream where the tooling is
+    already good at it.
+  * Every log record includes a stable set of fields: ``timestamp``,
+    ``level``, ``component``, ``message``, plus any ``extra`` the caller
+    passed. This gives you a clean dashboard schema.
+
+Public API:
+  * ``setup_logging(...)`` — call once at startup.
+  * ``get_component_logger(name)`` — for module-level loggers.
+  * ``get_request_logger()`` / ``get_performance_logger()`` — thin
+    wrappers that add a ``category`` tag so downstream queries can
+    split by class of event.
 """
 
+from __future__ import annotations
+
+import json
 import sys
 from pathlib import Path
+from typing import Any
+
 from loguru import logger
-from typing import Optional
+
+_CONFIGURED = False
 
 
-class LogConfig:
-    """Logging configuration for the RAGmodel service."""
+def _json_sink(message) -> None:
+    """Serialize a loguru record as a compact JSON line on stdout.
 
-    def __init__(
-        self,
-        environment: str = "development",
-        log_level: str = "INFO",
-        log_dir: str = "./logs",
-        retention_days: int = 30,
-        rotation_size: str = "100 MB",
-    ):
-        """
-        Initialize logging configuration.
-
-        Args:
-            environment: "development" or "production"
-            log_level: Minimum log level (TRACE, DEBUG, INFO, WARNING, ERROR, CRITICAL)
-            log_dir: Directory for log files
-            retention_days: Number of days to keep old logs
-            rotation_size: Maximum size before rotation (e.g., "100 MB", "500 MB")
-        """
-        self.environment = environment.lower()
-        self.log_level = log_level.upper()
-        self.log_dir = Path(log_dir)
-        self.retention = f"{retention_days} days"
-        self.rotation = rotation_size
-
-        # Create log directory if it doesn't exist
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-
-        # Track if logging has been configured
-        self._configured = False
-
-    def configure(self) -> None:
-        """Configure loguru logger with environment-specific settings."""
-        if self._configured:
-            logger.warning("Logging already configured, skipping reconfiguration")
-            return
-
-        # Remove default handler
-        logger.remove()
-
-        # Configure console handler based on environment
-        self._configure_console()
-
-        # Configure file handlers
-        self._configure_file_handlers()
-
-        # Add custom log levels if needed
-        self._configure_custom_levels()
-
-        self._configured = True
-        logger.info(
-            "Logging configured",
-            extra={
-                "environment": self.environment,
-                "log_level": self.log_level,
-                "log_dir": str(self.log_dir),
-            }
-        )
-
-    def _configure_console(self) -> None:
-        """Configure console output based on environment."""
-        if self.environment == "production":
-            # Production: JSON format for structured logging
-            logger.add(
-                sys.stderr,
-                level=self.log_level,
-                format="{message}",
-                serialize=True,  # JSON serialization
-                backtrace=True,
-                diagnose=False,  # Don't expose variable values in production
-            )
-        else:
-            # Development: Colored, human-readable format
-            logger.add(
-                sys.stderr,
-                level=self.log_level,
-                format=(
-                    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-                    "<level>{level: <8}</level> | "
-                    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-                    "<level>{message}</level>"
-                ),
-                colorize=True,
-                backtrace=True,
-                diagnose=True,  # Show variable values in development
-            )
-
-    def _configure_file_handlers(self) -> None:
-        """Configure file handlers for different log categories."""
-
-        # 1. General application logs
-        logger.add(
-            self.log_dir / "app.log",
-            level=self.log_level,
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
-            rotation=self.rotation,
-            retention=self.retention,
-            compression="zip",
-            enqueue=True,  # Thread-safe, async-safe
-            backtrace=True,
-            diagnose=self.environment != "production",
-        )
-
-        # 2. Error logs only (WARNING and above)
-        logger.add(
-            self.log_dir / "error.log",
-            level="WARNING",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
-            rotation=self.rotation,
-            retention=self.retention,
-            compression="zip",
-            enqueue=True,
-            backtrace=True,
-            diagnose=self.environment != "production",
-        )
-
-        # 3. Request logs (filtered by context)
-        logger.add(
-            self.log_dir / "requests.log",
-            level="INFO",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
-            rotation=self.rotation,
-            retention=self.retention,
-            compression="zip",
-            enqueue=True,
-            filter=lambda record: record.get("extra", {}).get("category") == "request",
-        )
-
-        # 4. Performance logs (filtered by context)
-        logger.add(
-            self.log_dir / "performance.log",
-            level="INFO",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
-            rotation=self.rotation,
-            retention=self.retention,
-            compression="zip",
-            enqueue=True,
-            filter=lambda record: record.get("extra", {}).get("category") == "performance",
-        )
-
-        # 5. Production JSON logs (for log aggregation tools)
-        if self.environment == "production":
-            logger.add(
-                self.log_dir / "app.json",
-                level=self.log_level,
-                format="{message}",
-                serialize=True,  # JSON format
-                rotation=self.rotation,
-                retention=self.retention,
-                compression="zip",
-                enqueue=True,
-                backtrace=True,
-                diagnose=False,
-            )
-
-    def _configure_custom_levels(self) -> None:
-        """Add custom log levels if needed."""
-        # Add a SUCCESS level for business logic milestones
-        # (Loguru already has success() method, just documenting usage)
-        pass
-
-    def get_logger(self, name: Optional[str] = None):
-        """
-        Get a logger instance with optional name binding.
-
-        Args:
-            name: Module or component name for context
-
-        Returns:
-            Logger instance with bound context
-        """
-        if not self._configured:
-            self.configure()
-
-        if name:
-            return logger.bind(component=name)
-        return logger
-
-
-# Convenience function for creating categorized loggers
-def get_request_logger():
-    """Get logger for HTTP requests."""
-    return logger.bind(category="request")
-
-
-def get_performance_logger():
-    """Get logger for performance metrics."""
-    return logger.bind(category="performance")
-
-
-def get_component_logger(component_name: str):
+    We render ourselves (instead of ``serialize=True``) so the field
+    names are stable and the ``extra`` dict is hoisted to top level
+    keys rather than nested.
     """
-    Get logger for a specific component.
+    record = message.record
+    payload: dict[str, Any] = {
+        "timestamp": record["time"].isoformat(),
+        "level": record["level"].name,
+        "message": record["message"],
+        "logger": record["name"],
+        "function": record["function"],
+        "line": record["line"],
+    }
+    # Promote extras (component, category, tenant, dataset_id, ...).
+    extras = {k: v for k, v in record["extra"].items() if not k.startswith("_")}
+    for k, v in extras.items():
+        payload[k] = v
+    if record["exception"]:
+        payload["exception"] = str(record["exception"].value)
 
-    Args:
-        component_name: Name of the component (e.g., "embedder", "vectorstore")
-
-    Returns:
-        Logger instance with component context
-    """
-    return logger.bind(component=component_name)
+    sys.stdout.write(json.dumps(payload, default=str) + "\n")
+    sys.stdout.flush()
 
 
-# Global logging configuration instance
-_log_config: Optional[LogConfig] = None
+_DEV_FORMAT = (
+    "<green>{time:HH:mm:ss.SSS}</green> "
+    "<level>{level: <7}</level> "
+    "<cyan>{extra[component]: <16}</cyan> "
+    "<level>{message}</level>"
+    "{extra[_context]}"
+)
+
+
+def _dev_formatter(record: dict) -> str:
+    """Human-readable line with a compact context suffix."""
+    record["extra"].setdefault("component", record["name"].split(".")[-1])
+    ignore = {"component"}
+    ctx = {
+        k: v
+        for k, v in record["extra"].items()
+        if k not in ignore and not k.startswith("_")
+    }
+    record["extra"]["_context"] = (
+        "  " + " ".join(f"{k}={v}" for k, v in ctx.items()) if ctx else ""
+    )
+    return _DEV_FORMAT + "\n{exception}"
 
 
 def setup_logging(
     environment: str = "development",
     log_level: str = "INFO",
-    log_dir: str = "./logs",
+    log_dir: str | None = "./logs",
     retention_days: int = 30,
     rotation_size: str = "100 MB",
 ) -> None:
-    """
-    Setup logging for the application.
-
-    This should be called once during application startup.
-
-    Args:
-        environment: "development" or "production"
-        log_level: Minimum log level
-        log_dir: Directory for log files
-        retention_days: Number of days to keep old logs
-        rotation_size: Maximum size before rotation
-    """
-    global _log_config
-
-    if _log_config is not None:
-        logger.warning("Logging already setup, skipping")
+    """Install the logging sinks. Idempotent."""
+    global _CONFIGURED
+    if _CONFIGURED:
         return
 
-    _log_config = LogConfig(
+    logger.remove()
+    level = log_level.upper()
+
+    if environment.lower() == "production":
+        logger.add(
+            _json_sink,
+            level=level,
+            backtrace=True,
+            diagnose=False,
+            enqueue=True,
+        )
+    else:
+        logger.add(
+            sys.stdout,
+            level=level,
+            format=_dev_formatter,
+            colorize=True,
+            backtrace=True,
+            diagnose=True,
+        )
+
+    # Optional file sink (always JSON, safe for any environment).
+    if log_dir:
+        path = Path(log_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            path / "service.jsonl",
+            level=level,
+            serialize=True,
+            rotation=rotation_size,
+            retention=f"{retention_days} days",
+            compression="zip",
+            enqueue=True,
+            backtrace=True,
+            diagnose=False,
+        )
+
+    _CONFIGURED = True
+    logger.bind(component="logging").info(
+        "Logging configured",
         environment=environment,
-        log_level=log_level,
-        log_dir=log_dir,
-        retention_days=retention_days,
-        rotation_size=rotation_size,
+        level=level,
+        log_dir=log_dir or "(none)",
     )
-    _log_config.configure()
 
 
-def get_logger_instance():
-    """Get the global logger instance."""
-    if _log_config is None:
-        # Auto-configure with defaults if not setup
-        setup_logging()
-    return logger
+# ---------------------------------------------------------------------------
+# Logger factories
+# ---------------------------------------------------------------------------
+def get_component_logger(component_name: str):
+    """Return a logger bound to a component name."""
+    return logger.bind(component=component_name)
+
+
+def get_request_logger():
+    """Logger for HTTP request lifecycle events."""
+    return logger.bind(component="http", category="request")
+
+
+def get_performance_logger():
+    """Logger for timing/performance events."""
+    return logger.bind(component="perf", category="performance")

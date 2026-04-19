@@ -1,117 +1,145 @@
-"""
-API Models
+"""API request and response models."""
 
-Pydantic models for request validation and response formatting.
-"""
+from __future__ import annotations
 
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Any, Optional
 
-
-# Collection Models
-class CollectionCreate(BaseModel):
-    """Request model for creating a collection."""
-    name: str = Field(..., description="Collection name", min_length=1, max_length=100)
-    # vector_size: int = Field(768, description="Vector dimension size", ge=128, le=3072)
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class CollectionResponse(BaseModel):
-    """Response model for collection information."""
-    name: str
-    vector_count: int
-    vector_size: int
-    distance: str
+# ---------------------------------------------------------------------------
+# Tenants
+# ---------------------------------------------------------------------------
+class TenantCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
 
 
-class CollectionList(BaseModel):
-    """Response model for listing collections."""
-    collections: List[str]
+class TenantInfo(BaseModel):
+    tenant: str
+    collection: str
+    object_count: int
 
 
-# Document Models
-class DocumentDelete(BaseModel):
-    """Request model for deleting a document."""
-    dataset_id: str = Field(..., description="Dataset identifier to delete", min_length=1)
-
-
-class DocumentDeleteResponse(BaseModel):
-    """Response model after deleting a document."""
-    dataset_id: str
-    message: str
-
-
-class SimpleDocument(BaseModel):
-    """Single document in simple format."""
-    url: str = Field(..., description="Source URL for this document", min_length=1)
-    text: str = Field(..., description="Text content to embed", min_length=1)
-    meta: Optional[Dict[str, Any]] = Field(None, description="Optional metadata (rating, author, date, etc.)")
-
-
-class BatchDocumentAdd(BaseModel):
-    """Request model for batch upload of preprocessed documents."""
-    documents: List[SimpleDocument] = Field(..., description="List of documents in {url, text, meta} format")
-
-
-class BatchDocumentAddResponse(BaseModel):
-    """Response model after batch document upload."""
-    dataset_id: str
-    documents_processed: int
-    chunks_stored: int
-    documents_skipped: int
-    warnings: List[str] = []
-    message: str
-
-
-# Search Models
-class SearchRequest(BaseModel):
-    """Request model for searching."""
-    query: str = Field(..., description="Search query text", min_length=1)
-    filters: Optional[Dict[str, Any]] = Field(
-        None,
-        description="Optional metadata filters (doc_type, rating, category, etc.)",
-        examples=[{"doc_type": "reviews"}, None]
-    )
-
-
-class SearchResultMetadata(BaseModel):
-    """Metadata for a search result."""
-    model_config = {"extra": "allow"}  # Allow additional flexible fields
-
-    dataset_id: str  # Dataset identifier
-    chunk_index: int
-    chunk_count: int
-    created_at: str
-    # Additional metadata fields (doc_type, rating, category, etc.) allowed dynamically
-
-
-class SearchResult(BaseModel):
-    """Single search result."""
-    score: float = Field(..., description="Similarity score (0-1, higher is better)")
-    text: str = Field(..., description="Matched text chunk")
-    metadata: SearchResultMetadata
-
-
-class SearchResponse(BaseModel):
-    """Response model for search results."""
-    query: str
-    results: List[SearchResult]
+class TenantList(BaseModel):
+    tenants: list[str]
     count: int
 
 
-# Error Models
-class ErrorResponse(BaseModel):
-    """Standard error response."""
-    error: str
-    detail: Optional[str] = None
+# ---------------------------------------------------------------------------
+# Datasets (sub-namespaces within a tenant)
+# ---------------------------------------------------------------------------
+class DatasetList(BaseModel):
+    tenant: str
+    datasets: list[str]
+    count: int
 
 
-# Health Check
+class DatasetDeleteResponse(BaseModel):
+    tenant: str
+    dataset_id: str
+    objects_deleted: int
+
+
+# ---------------------------------------------------------------------------
+# Documents
+# ---------------------------------------------------------------------------
+class DocumentIn(BaseModel):
+    """One pre-structured record (a review, product, Q&A, etc.).
+
+    Each record is stored as a single atomic object. We do not auto-chunk
+    structured inputs because splitting a review mid-sentence throws away
+    context the embedding model should see.
+    """
+
+    url: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1)
+    meta: Optional[dict[str, Any]] = None
+
+
+class BatchUploadRequest(BaseModel):
+    documents: list[DocumentIn] = Field(..., min_length=1)
+
+
+class BatchUploadResponse(BaseModel):
+    tenant: str
+    dataset_id: str
+    inserted: int
+    skipped: int
+    warnings: list[str] = []
+    timing_ms: dict[str, float]
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+class HybridSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    filters: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Equality filters on indexed properties (rating, author, category, ...)",
+    )
+    alpha: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Hybrid fusion weight. 0.0 = pure BM25, 1.0 = pure vector.",
+    )
+    limit: int = Field(default=10, ge=1, le=100)
+
+
+class SearchHitMetadata(BaseModel):
+    """Optional / dynamic metadata attached to a hit."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class SearchHitOut(BaseModel):
+    object_id: str
+    score: float
+    text: str
+    dataset_id: str
+    chunk_index: int
+    chunk_count: int
+    created_at: str
+    metadata: SearchHitMetadata
+    explain_score: Optional[str] = None
+
+
+class SearchResponse(BaseModel):
+    tenant: str
+    dataset_id: Optional[str]
+    query: str
+    alpha: float
+    results: list[SearchHitOut]
+    count: int
+    timing_ms: dict[str, float]
+
+
+# ---------------------------------------------------------------------------
+# Generative RAG (Day 3 endpoint)
+# ---------------------------------------------------------------------------
+class GenerateRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    filters: Optional[dict[str, Any]] = None
+    alpha: float = Field(default=0.5, ge=0.0, le=1.0)
+    limit: int = Field(default=5, ge=1, le=20)
+    dataset_id: Optional[str] = None
+
+
+class GenerateResponse(BaseModel):
+    tenant: str
+    query: str
+    answer: str
+    sources: list[SearchHitOut]
+    timing_ms: dict[str, float]
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 class HealthResponse(BaseModel):
-    """Health check response."""
     status: str
-    gemini_configured: bool
-    qdrant_configured: bool
-    version: str = "1.0.0"
-
-
-# 
+    weaviate_ready: bool
+    embedder_backend: str
+    embedding_dimension: int
+    version: str = "2.0.0"
