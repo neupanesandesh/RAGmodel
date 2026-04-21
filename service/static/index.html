@@ -177,7 +177,7 @@ footer a{color:var(--accent2);text-decoration:none}
       <div class="info-grid" id="infoGrid">
         <div class="info-card"><div class="val" id="infoVersion">-</div><div class="lbl">Version</div></div>
         <div class="info-card"><div class="val" id="infoStatus">-</div><div class="lbl">Status</div></div>
-        <div class="info-card"><div class="val" id="infoGemini">-</div><div class="lbl">Gemini</div></div>
+        <div class="info-card"><div class="val" id="infoEmbedder">-</div><div class="lbl">Embedder</div></div>
         <div class="info-card"><div class="val" id="infoQdrant">-</div><div class="lbl">Qdrant</div></div>
       </div>
     </div>
@@ -190,7 +190,7 @@ footer a{color:var(--accent2);text-decoration:none}
   </div>
 
   <footer>
-    RAG Embedding Service v1.0.0 &mdash; Powered by Gemini Embeddings + Qdrant &mdash; <a href="/docs">API Docs</a>
+    RAGmodel v2.0.0 &mdash; Powered by Qdrant + local open-source embeddings &mdash; <a href="/docs">API Docs</a>
   </footer>
 </div>
 
@@ -415,7 +415,7 @@ async function loadInfo() {
     const h = await hr.json(), root = await rr.json();
     document.getElementById('infoVersion').textContent = h.version || root.version || '-';
     document.getElementById('infoStatus').textContent = h.status || '-';
-    document.getElementById('infoGemini').textContent = h.gemini_configured ? 'Connected' : 'Not configured';
+    document.getElementById('infoEmbedder').textContent = h.embedder_ready ? (h.embedder_model || 'Ready') : 'Not ready';
     document.getElementById('infoQdrant').textContent = h.qdrant_configured ? 'Connected' : 'Not configured';
   } catch {}
 }

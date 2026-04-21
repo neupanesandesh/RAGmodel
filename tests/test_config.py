@@ -1,79 +1,73 @@
 """
-Tests for configuration validation.
-
-Catches missing env vars before deployment.
+Configuration validation tests.
 """
 
 import pytest
-import os
-from service.config import Settings
+
+from service.config import Settings, validate_settings
 
 
-class TestConfigValidation:
-    """Test configuration validation."""
+class TestSettings:
+    def test_defaults(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        s = Settings()
+        assert s.embedder_backend == "sentence-transformers"
+        assert s.embedder_model == "BAAI/bge-small-en-v1.5"
+        assert s.embedding_dimension == 384
+        assert s.qdrant_url == "http://localhost:6333"
+        assert s.qdrant_collection == "ragmodel"
+        assert s.hybrid_search_enabled is True
+        assert s.is_production is False
 
-    def test_valid_config(self, monkeypatch):
-        """Valid config should pass validation."""
-        # Set valid environment variables
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
-        monkeypatch.setenv("EMBEDDING_DIMENSION", "768")
-        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+    def test_invalid_backend_rejected(self, monkeypatch):
+        monkeypatch.setenv("EMBEDDER_BACKEND", "not-a-real-backend")
+        with pytest.raises(ValueError):
+            Settings()
 
-        # Create new settings object with monkeypatched env vars
-        settings = Settings()
+    def test_invalid_environment_rejected(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "bogus")
+        with pytest.raises(ValueError):
+            Settings()
 
-        # Validate should pass
-        assert settings.gemini_api_key == "test-key-123"
-        assert settings.embedding_dimension == 768
-        assert settings.qdrant_url == "http://localhost:6333"
+    def test_invalid_log_level_rejected(self, monkeypatch):
+        monkeypatch.setenv("LOG_LEVEL", "SHOUT")
+        with pytest.raises(ValueError):
+            Settings()
 
-    # def test_missing_gemini_api_key(self, monkeypatch):
-    #     """Missing API key should raise error."""
-    #     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    #     monkeypatch.setenv("EMBEDDING_DIMENSION", "768")
-    #     monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+    def test_cors_origins_list(self, monkeypatch):
+        monkeypatch.setenv("CORS_ORIGINS", "http://a.com, http://b.com ,http://c.com")
+        s = Settings()
+        assert s.cors_origins_list == ["http://a.com", "http://b.com", "http://c.com"]
 
-    #     # Create settings with missing API key
-    #     settings = Settings()
 
-    #     # Validation should fail
-    #     assert not settings.gemini_api_key or settings.gemini_api_key == ""
+class TestValidateSettings:
+    """validate_settings() should block unsafe prod config."""
 
-    def test_invalid_embedding_dimension(self, monkeypatch):
-        """Invalid dimension should raise error."""
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setenv("EMBEDDING_DIMENSION", "999")  # Invalid!
-        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+    def test_production_requires_real_api_key(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("API_KEY", "change-me-in-production")
+        monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com")
 
-        # Create settings with invalid dimension
-        settings = Settings()
+        import service.config as cfg
+        cfg.settings = Settings()
+        with pytest.raises(ValueError, match="API_KEY"):
+            validate_settings()
 
-        # Should have the invalid dimension
-        assert settings.embedding_dimension == 999
+    def test_production_rejects_wildcard_cors(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("API_KEY", "real-secret-key")
+        monkeypatch.setenv("CORS_ORIGINS", "*")
 
-        # Validation function should reject it
-        valid_dimensions = [768, 1536, 3072]
-        assert settings.embedding_dimension not in valid_dimensions
+        import service.config as cfg
+        cfg.settings = Settings()
+        with pytest.raises(ValueError, match="CORS_ORIGINS"):
+            validate_settings()
 
-    def test_valid_embedding_dimensions(self, monkeypatch):
-        """Valid dimensions (768, 1536, 3072) should pass."""
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+    def test_development_permissive(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("API_KEY", "")
+        monkeypatch.setenv("CORS_ORIGINS", "*")
 
-        valid_dimensions = [768, 1536, 3072]
-        for dimension in ["768", "1536", "3072"]:
-            monkeypatch.setenv("EMBEDDING_DIMENSION", dimension)
-            settings = Settings()
-            assert settings.embedding_dimension in valid_dimensions
-
-    # def test_missing_qdrant_url(self, monkeypatch):
-    #     """Missing Qdrant URL should raise error."""
-    #     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    #     monkeypatch.setenv("EMBEDDING_DIMENSION", "768")
-    #     monkeypatch.delenv("QDRANT_URL", raising=False)
-
-    #     # Create settings with missing Qdrant URL
-    #     settings = Settings()
-
-    #     # Should be empty or default
-    #     assert not settings.qdrant_url or settings.qdrant_url == "http://localhost:6333"
+        import service.config as cfg
+        cfg.settings = Settings()
+        validate_settings()

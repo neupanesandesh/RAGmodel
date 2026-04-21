@@ -1,66 +1,29 @@
 # Tests
 
-Simple tests for critical parts only.
+Focused tests for the parts most likely to regress.
 
-## Running Tests
+## Running
 
 ```bash
-# Install dev dependencies
 pip install -e ".[dev]"
-
-# Run all tests
-pytest
-
-# Run with coverage
+pytest                          # full suite
+pytest tests/test_config.py -v  # single file
 pytest --cov=service --cov=client
-
-# Run specific test file
-pytest tests/test_chunking.py -v
 ```
 
-## What We Test
+`test_vectorstore.py` runs against an in-process Qdrant via `QdrantStore(url=":memory:")` — no external service required. The CI workflow also runs the suite against a real Qdrant 1.12.4 service container (`.github/workflows/ci.yml`).
 
-### ✅ test_chunking.py
-**Why:** Chunking affects search quality - bugs here break everything.
+## Files
 
-Tests:
-- Empty text handling
-- Small text (single chunk)
-- Medium text (paragraph splitting)
-- Large text (sliding window)
-- Edge cases (whitespace, single word)
+| File | Covers |
+|---|---|
+| `test_config.py` | `Settings` defaults + `validate_settings()` — rejects default API key and wildcard CORS in production. |
+| `test_chunking.py` | Text chunking edge cases (empty, small, paragraph split, sliding window). |
+| `test_vectorstore.py` | Tenant isolation, dataset scoping, idempotent ingest via UUID5 ids, delete. |
+| `test_main_smoke.py` | FastAPI wiring — health, OpenAPI surface, API-key and admin-key gating. |
 
-### ✅ test_config.py
-**Why:** Catches missing environment variables before deployment.
+## What we don't test
 
-Tests:
-- Valid configuration passes
-- Missing GEMINI_API_KEY fails
-- Invalid embedding dimensions fail
-- Missing QDRANT_URL fails
-
-## Test Structure
-
-```
-tests/
-├── __init__.py
-├── conftest.py          # Shared fixtures (sample texts)
-├── test_chunking.py     # Chunking logic tests
-└── test_config.py       # Configuration tests
-```
-
-**Clean and simple. No complex mocking, no heavy setup.**
-
-## Adding More Tests
-
-Only add tests for **critical parts that break things**.
-
-Don't test:
-- ❌ Third-party libraries
-- ❌ Simple getters/setters
-- ❌ Constants
-
-Do test:
-- ✅ Core business logic
-- ✅ Error handling
-- ✅ Configuration validation
+- Third-party libraries (fastembed, sentence-transformers, qdrant-client internals).
+- Qdrant behaviour that's trivially covered by the client (the wrappers add no logic).
+- Anything that would require loading a real embedding model — `test_main_smoke.py` mocks the embedder and vector store instead.

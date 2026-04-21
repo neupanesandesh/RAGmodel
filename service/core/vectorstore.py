@@ -1,561 +1,440 @@
 """
-Qdrant Vector Store Module
+Async Qdrant store with native multi-tenancy and hybrid search.
 
-Manages all interactions with Qdrant for storing and searching vectors.
-Provides clean abstractions for collection management and vector operations.
+Design notes
+------------
+- ONE physical Qdrant collection holds all tenants. Tenant isolation is done
+  via a `tenant_id` payload index flagged `is_tenant=True` (Qdrant 1.7+),
+  which is the vendor-recommended pattern for multi-tenant RAG. Avoids the
+  "N HNSW graphs" anti-pattern we'd get with a collection per customer.
+
+- Two named vectors per point:
+    * "dense"  — float vectors (cosine) from the embedder
+    * "sparse" — BM25 / SPLADE (optional, only populated when hybrid enabled)
+
+- Search uses `query_points` (Qdrant 1.10+). Hybrid search uses server-side
+  RRF fusion via `Prefetch` + `FusionQuery` — no Python-side merging.
+
+- `list_datasets` uses the `facet` API (Qdrant 1.12+) instead of scrolling
+  the whole collection, so it stays O(unique values) rather than O(points).
+
+- Deterministic UUID5 point IDs make ingest idempotent: re-uploading the
+  same (tenant, dataset, chunk_index) overwrites rather than duplicates.
 """
 
-from typing import List, Dict, Optional, Any
-from datetime import datetime
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-    PayloadSchemaType
-)
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
 import uuid
+
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models as qm
+
 from service.logging_config import get_component_logger
 
-# Initialize logger for vectorstore module
 logger = get_component_logger("vectorstore")
 
 
+_TENANT_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+
+def _point_id(tenant_id: str, dataset_id: str, chunk_index: int) -> str:
+    return str(uuid.uuid5(_TENANT_NAMESPACE, f"{tenant_id}::{dataset_id}::{chunk_index}"))
+
+
 class QdrantStore:
-    """
-    Wrapper for Qdrant vector database operations.
+    """Async wrapper around a single multi-tenant Qdrant collection."""
 
-    Features:
-    - Collection management (create, delete, list)
-    - Payload index creation with tenant isolation support
-    - Document storage with flexible metadata (tenant-based multitenancy)
-    - Semantic search with tenant isolation and flexible filtering
-    - Document deletion
-
-    Args:
-        url: Qdrant server URL (default: localhost:6333)
-        api_key: Optional API key for cloud Qdrant
-    """
-    
-    def __init__(self, url: str = "http://localhost:6333", api_key: Optional[str] = None):
-        if api_key:
-            self.client = QdrantClient(url=url, api_key=api_key)
-        else:
-            self.client = QdrantClient(url=url)
-
-        logger.debug(f"QdrantStore initialized", extra={"url": url, "has_api_key": bool(api_key)})
-    
-    def create_collection(self, collection_name: str, vector_size: int = 768, create_document_index: bool = True) -> bool:
-        """
-        Create a new collection for storing vectors.
-
-        Args:
-            collection_name: Name of the collection (company name, e.g., 'auditcity')
-            vector_size: Dimension of vectors (default: 768)
-            create_document_index: Whether to create dataset_id index (default: True)
-
-        Returns:
-            True if created successfully
-
-        Raises:
-            Exception: If collection already exists or creation fails
-        """
-        try:
-            # Check if collection already exists
-            collections = self.client.get_collections().collections
-            if any(c.name == collection_name for c in collections):
-                logger.warning(
-                    f"Collection already exists: {collection_name}",
-                    extra={"collection_name": collection_name}
-                )
-                raise Exception(f"Collection '{collection_name}' already exists")
-
-            logger.info(
-                f"Creating collection: {collection_name}",
-                extra={"collection_name": collection_name, "vector_size": vector_size}
-            )
-
-            # Create collection with cosine distance metric
-            # Cosine is ideal for normalized embeddings (measures angle, not magnitude)
-            self.client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=vector_size,
-                    distance=Distance.COSINE
-                )
-            )
-
-            # Create payload index for dataset_id
-            if create_document_index:
-                self.create_payload_index(
-                    collection_name=collection_name,
-                    field_name="dataset_id",
-                    field_schema=PayloadSchemaType.KEYWORD
-                )
-                logger.info(
-                    f"Created dataset_id payload index",
-                    extra={"collection_name": collection_name}
-                )
-
-            logger.success(
-                f"Collection created successfully: {collection_name}",
-                extra={"collection_name": collection_name, "vector_size": vector_size}
-            )
-            return True
-
-        except Exception as e:
-            logger.error(
-                f"Failed to create collection: {collection_name}",
-                extra={"collection_name": collection_name, "error": str(e)}
-            )
-            raise Exception(f"Failed to create collection: {str(e)}")
-    
-    def delete_collection(self, collection_name: str) -> bool:
-        """
-        Delete a collection and all its vectors.
-
-        Args:
-            collection_name: Name of the collection to delete
-
-        Returns:
-            True if deleted successfully
-
-        Raises:
-            Exception: If collection doesn't exist or deletion fails
-        """
-        # Check if collection exists first
-        if not self.collection_exists(collection_name):
-            raise Exception(f"Collection '{collection_name}' does not exist")
-
-        try:
-            self.client.delete_collection(collection_name=collection_name)
-            return True
-        except Exception as e:
-            raise Exception(f"Failed to delete collection: {str(e)}")
-    
-    def list_collections(self) -> List[str]:
-        """
-        List all collection names.
-        
-        Returns:
-            List of collection names
-        """
-        collections = self.client.get_collections().collections
-        return [c.name for c in collections]
-    
-    def collection_exists(self, collection_name: str) -> bool:
-        """
-        Check if a collection exists.
-
-        Args:
-            collection_name: Name of the collection
-
-        Returns:
-            True if collection exists
-        """
-        return collection_name in self.list_collections()
-
-    def create_payload_index(
+    def __init__(
         self,
-        collection_name: str,
-        field_name: str,
-        field_schema: PayloadSchemaType = PayloadSchemaType.KEYWORD
-    ) -> bool:
-        """
-        Create a payload index for efficient filtering.
+        url: str,
+        collection: str,
+        dense_dim: int,
+        api_key: Optional[str] = None,
+        timeout: int = 30,
+    ):
+        self.collection = collection
+        self.dense_dim = dense_dim
+        self.client = AsyncQdrantClient(
+            url=url,
+            api_key=api_key,
+            timeout=timeout,
+            prefer_grpc=False,
+        )
+        logger.info(
+            "QdrantStore initialised",
+            url=url,
+            collection=collection,
+            dense_dim=dense_dim,
+        )
 
-        Args:
-            collection_name: Collection to create index in
-            field_name: Payload field to index (e.g., 'tenant_id', 'business_id')
-            field_schema: Field type (KEYWORD for exact match, TEXT for full-text search)
+    # --------------------------------------------------------------
+    # Lifecycle
+    # --------------------------------------------------------------
+    async def ensure_ready(self, with_sparse: bool) -> None:
+        """Create the physical collection and payload indexes if missing."""
+        existing = {c.name for c in (await self.client.get_collections()).collections}
 
-        Returns:
-            True if index created successfully
-
-        Raises:
-            Exception: If collection doesn't exist or index creation fails
-        """
-        if not self.collection_exists(collection_name):
-            raise Exception(f"Collection '{collection_name}' does not exist")
-
-        try:
+        if self.collection not in existing:
+            vectors_config = {
+                "dense": qm.VectorParams(size=self.dense_dim, distance=qm.Distance.COSINE),
+            }
+            sparse_config = (
+                {"sparse": qm.SparseVectorParams(index=qm.SparseIndexParams(on_disk=False))}
+                if with_sparse
+                else None
+            )
+            await self.client.create_collection(
+                collection_name=self.collection,
+                vectors_config=vectors_config,
+                sparse_vectors_config=sparse_config,
+            )
             logger.info(
-                f"Creating payload index: {field_name}",
-                extra={
-                    "collection": collection_name,
-                    "field": field_name,
-                    "schema": field_schema
-                }
+                "physical collection created",
+                name=self.collection,
+                hybrid=with_sparse,
             )
 
-            self.client.create_payload_index(
-                collection_name=collection_name,
-                field_name=field_name,
-                field_schema=field_schema
-            )
+        await self._ensure_payload_indexes()
 
-            logger.success(
-                f"Payload index created: {field_name}",
-                extra={"collection": collection_name, "field": field_name}
-            )
-            return True
+    async def _ensure_payload_indexes(self) -> None:
+        """Idempotent; Qdrant returns 200 even when an index already exists."""
+        # Tenant index — powers multi-tenant isolation. is_tenant=True tells
+        # Qdrant to optimise the HNSW graph for per-tenant queries.
+        await self.client.create_payload_index(
+            collection_name=self.collection,
+            field_name="tenant_id",
+            field_schema=qm.KeywordIndexParams(
+                type=qm.KeywordIndexType.KEYWORD,
+                is_tenant=True,
+            ),
+        )
+        await self.client.create_payload_index(
+            collection_name=self.collection,
+            field_name="dataset_id",
+            field_schema=qm.PayloadSchemaType.KEYWORD,
+        )
+        logger.info("payload indexes ready")
 
-        except Exception as e:
-            logger.error(
-                f"Failed to create payload index: {field_name}",
-                extra={"collection": collection_name, "field": field_name, "error": str(e)}
-            )
-            raise Exception(f"Failed to create payload index: {str(e)}")
+    async def close(self) -> None:
+        await self.client.close()
 
-    def add_document(
-        self,
-        collection_name: str,
-        doc_id: str,
-        chunks: List[tuple],  # List of (text, chunk_index)
-        embeddings: List[List[float]],
-        dataset_id: str,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> int:
+    # --------------------------------------------------------------
+    # Tenants (mapped to external "collections")
+    # --------------------------------------------------------------
+    async def register_tenant(self, tenant_id: str) -> None:
+        """No-op on the physical collection; tenants are implicit from ingest.
+        Exists so the public `POST /collections/{name}` route keeps working.
         """
-        Add a document's chunks to the collection.
+        logger.info("tenant registered", tenant_id=tenant_id)
 
-        This is the core storage operation. Each chunk becomes a point in Qdrant
-        with its embedding and payload (text, dataset_id, custom metadata, etc).
+    async def delete_tenant(self, tenant_id: str) -> int:
+        """Delete every point belonging to a tenant."""
+        if not await self.tenant_exists(tenant_id):
+            raise ValueError(f"Tenant '{tenant_id}' does not exist")
 
-        Args:
-            collection_name: Target collection (company name, e.g., 'auditcity')
-            doc_id: Internal identifier (typically same as dataset_id)
-            chunks: List of (chunk_text, chunk_index) tuples
-            embeddings: List of embedding vectors (one per chunk)
-            dataset_id: Document/dataset name (required - e.g., 'dallas-dentist', 'austin-pizza')
-            metadata: Optional flexible metadata dict for filtering (doc_type, rating, category, etc.)
+        flt = qm.Filter(must=[qm.FieldCondition(key="tenant_id", match=qm.MatchValue(value=tenant_id))])
+        await self.client.delete(collection_name=self.collection, points_selector=flt)
+        logger.warning("tenant deleted", tenant_id=tenant_id)
+        return 1
 
-        Returns:
-            Number of chunks stored
+    async def tenant_exists(self, tenant_id: str) -> bool:
+        count = await self.client.count(
+            collection_name=self.collection,
+            count_filter=qm.Filter(
+                must=[qm.FieldCondition(key="tenant_id", match=qm.MatchValue(value=tenant_id))]
+            ),
+            exact=False,
+        )
+        return count.count > 0
 
-        Raises:
-            ValueError: If chunks and embeddings length mismatch
-            Exception: If storage fails
-        """
-        if len(chunks) != len(embeddings):
-            raise ValueError("Chunks and embeddings must have same length")
+    async def list_tenants(self, limit: int = 10_000) -> List[str]:
+        result = await self.client.facet(
+            collection_name=self.collection,
+            key="tenant_id",
+            limit=limit,
+        )
+        return sorted([hit.value for hit in result.hits])
 
-        if not self.collection_exists(collection_name):
-            raise Exception(f"Collection '{collection_name}' does not exist")
+    async def tenant_info(self, tenant_id: str) -> Dict[str, Any]:
+        if not await self.tenant_exists(tenant_id):
+            raise ValueError(f"Tenant '{tenant_id}' does not exist")
 
-        try:
-            logger.info(
-                f"Adding document to collection: {dataset_id}",
-                extra={
-                    "collection": collection_name,
-                    "dataset_id": dataset_id,
-                    "chunks_count": len(chunks),
-                    "metadata": metadata
-                }
-            )
-
-            # Prepare points for Qdrant
-            points = []
-            chunk_count = len(chunks)
-            timestamp = datetime.utcnow().isoformat()
-
-            for (chunk_text, chunk_index), embedding in zip(chunks, embeddings):
-                # Generate unique point ID
-                point_id = str(uuid.uuid4())
-
-                # Build payload with core fields
-                payload = {
-                    "dataset_id": dataset_id,  # Document/dataset name (always available)
-                    "chunk_index": chunk_index,
-                    "chunk_count": chunk_count,
-                    "text": chunk_text,
-                    "created_at": timestamp
-                }
-
-                # Merge optional metadata if provided
-                if metadata:
-                    payload.update(metadata)
-
-                # Create point
-                point = PointStruct(
-                    id=point_id,
-                    vector=embedding,
-                    payload=payload
-                )
-                points.append(point)
-
-            # Upload to Qdrant
-            self.client.upsert(
-                collection_name=collection_name,
-                points=points
-            )
-
-            logger.success(
-                f"Document added successfully: {dataset_id}",
-                extra={
-                    "collection": collection_name,
-                    "dataset_id": dataset_id,
-                    "points_stored": len(points)
-                }
-            )
-
-            return len(points)
-
-        except Exception as e:
-            logger.error(
-                f"Failed to add document: {dataset_id}",
-                extra={"collection": collection_name, "dataset_id": dataset_id, "error": str(e)}
-            )
-            raise Exception(f"Failed to add document: {str(e)}")
-    
-    def search(
-        self,
-        collection_name: str,
-        query_vector: List[float],
-        dataset_id: Optional[str] = None,
-        k: int = 10,
-        filters: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Search for similar vectors in the collection.
-
-        Args:
-            collection_name: Collection to search (company name, e.g., 'auditcity')
-            query_vector: Query embedding vector
-            dataset_id: Document/dataset name to search within (optional - e.g., 'dallas-dentist').
-                        If not provided or empty, searches entire collection.
-            k: Number of results to return
-            filters: Optional metadata filters (doc_type, rating, category, etc.)
-
-        Returns:
-            List of search results with score, text, and metadata
-            Format: [{"score": float, "text": str, "metadata": dict}, ...]
-
-        Raises:
-            Exception: If search fails
-        """
-        if not self.collection_exists(collection_name):
-            raise Exception(f"Collection '{collection_name}' does not exist")
-
-        try:
-            # Normalize dataset_id: treat empty, whitespace, or placeholder values as None
-            if dataset_id:
-                dataset_id = dataset_id.strip()
-                # Treat empty string or common placeholders as None
-                if dataset_id in ("", "string", "null"):
-                    dataset_id = None
-
-            logger.debug(
-                f"Searching in collection: {collection_name}",
-                extra={"collection": collection_name, "k": k, "dataset_id": dataset_id, "filters": filters}
-            )
-
-            # Build filter conditions
-            must_conditions = []
-
-            # Add dataset_id filter if provided (for document-specific search)
-            if dataset_id:
-                must_conditions.append(
-                    FieldCondition(
-                        key="dataset_id",
-                        match=MatchValue(value=dataset_id)
-                    )
-                )
-
-            # Add additional metadata filters if provided
-            if filters:
-                for key, value in filters.items():
-                    # Skip empty or None values
-                    if value is not None and value != "":
-                        must_conditions.append(
-                            FieldCondition(
-                                key=key,
-                                match=MatchValue(value=value)
-                            )
-                        )
-
-            # Build query filter (None if no conditions)
-            query_filter = Filter(must=must_conditions) if must_conditions else None
-
-            # Execute search
-            results = self.client.search(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                limit=k,
-                query_filter=query_filter
-            )
-
-            # Format results for easy consumption
-            formatted_results = []
-            for result in results:
-                # Extract core metadata fields
-                metadata = {
-                    "dataset_id": result.payload.get("dataset_id"),
-                    "chunk_index": result.payload.get("chunk_index"),
-                    "chunk_count": result.payload.get("chunk_count"),
-                    "created_at": result.payload.get("created_at")
-                }
-
-                # Add all other payload fields as flexible metadata
-                for key, value in result.payload.items():
-                    if key not in ["text", "chunk_index", "chunk_count", "dataset_id", "created_at"]:
-                        metadata[key] = value
-
-                formatted_results.append({
-                    "score": result.score,
-                    "text": result.payload.get("text", ""),
-                    "metadata": metadata
-                })
-
-            search_scope = f"document '{dataset_id}'" if dataset_id else "entire collection"
-            logger.info(
-                f"Search completed in {collection_name} ({search_scope})",
-                extra={
-                    "collection": collection_name,
-                    "dataset_id": dataset_id,
-                    "search_scope": search_scope,
-                    "results_found": len(formatted_results),
-                    "requested": k
-                }
-            )
-
-            return formatted_results
-
-        except Exception as e:
-            logger.error(
-                f"Search failed in {collection_name}: {str(e)}",
-                extra={"collection": collection_name, "error": str(e)}
-            )
-            raise Exception(f"Search failed: {str(e)}")
-    
-    def delete_document(self, collection_name: str, dataset_id: str) -> int:
-        """
-        Delete all chunks of a document from the collection.
-
-        Args:
-            collection_name: Collection containing the document
-            dataset_id: Document/dataset ID to delete
-
-        Returns:
-            Number of chunks deleted
-
-        Raises:
-            Exception: If collection or document doesn't exist, or deletion fails
-        """
-        if not self.collection_exists(collection_name):
-            raise Exception(f"Collection '{collection_name}' does not exist")
-
-        try:
-            # First check if document exists by searching for it
-            results = self.client.scroll(
-                collection_name=collection_name,
-                scroll_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="dataset_id",
-                            match=MatchValue(value=dataset_id)
-                        )
-                    ]
-                ),
-                limit=1
-            )
-
-            # Check if any points were found
-            if not results[0]:  # results is a tuple: (points, next_offset)
-                raise Exception(f"Document '{dataset_id}' does not exist in collection '{collection_name}'")
-
-            # Delete all points with this dataset_id
-            self.client.delete(
-                collection_name=collection_name,
-                points_selector=Filter(
-                    must=[
-                        FieldCondition(
-                            key="dataset_id",
-                            match=MatchValue(value=dataset_id)
-                        )
-                    ]
-                )
-            )
-
-            # Note: Qdrant doesn't return count of deleted items
-            # We return 1 to indicate success
-            return 1
-
-        except Exception as e:
-            raise Exception(f"Failed to delete document: {str(e)}")
-    
-    def get_collection_info(self, collection_name: str) -> Dict[str, Any]:
-        """
-        Get information about a collection.
-
-        Args:
-            collection_name: Collection name
-
-        Returns:
-            Dictionary with collection stats
-        """
-        if not self.collection_exists(collection_name):
-            raise Exception(f"Collection '{collection_name}' does not exist")
-
-        info = self.client.get_collection(collection_name=collection_name)
+        count = await self.client.count(
+            collection_name=self.collection,
+            count_filter=qm.Filter(
+                must=[qm.FieldCondition(key="tenant_id", match=qm.MatchValue(value=tenant_id))]
+            ),
+            exact=True,
+        )
+        info = await self.client.get_collection(collection_name=self.collection)
+        dense_params = info.config.params.vectors["dense"]
         return {
-            "name": collection_name,
-            "vector_count": info.points_count,
-            "vector_size": info.config.params.vectors.size,
-            "distance": info.config.params.vectors.distance
+            "name": tenant_id,
+            "vector_count": count.count,
+            "vector_size": dense_params.size,
+            "distance": dense_params.distance.value if hasattr(dense_params.distance, "value") else str(dense_params.distance),
         }
 
-    def list_datasets(self, collection_name: str) -> List[str]:
-        """
-        List all unique dataset IDs in a collection.
+    # --------------------------------------------------------------
+    # Datasets (logical sub-grouping inside a tenant)
+    # --------------------------------------------------------------
+    async def list_datasets(self, tenant_id: str, limit: int = 10_000) -> List[str]:
+        result = await self.client.facet(
+            collection_name=self.collection,
+            key="dataset_id",
+            facet_filter=qm.Filter(
+                must=[qm.FieldCondition(key="tenant_id", match=qm.MatchValue(value=tenant_id))]
+            ),
+            limit=limit,
+        )
+        return sorted([hit.value for hit in result.hits])
 
-        Args:
-            collection_name: Collection name
+    async def delete_dataset(self, tenant_id: str, dataset_id: str) -> int:
+        flt = qm.Filter(
+            must=[
+                qm.FieldCondition(key="tenant_id", match=qm.MatchValue(value=tenant_id)),
+                qm.FieldCondition(key="dataset_id", match=qm.MatchValue(value=dataset_id)),
+            ]
+        )
+        existing = await self.client.count(collection_name=self.collection, count_filter=flt, exact=False)
+        if existing.count == 0:
+            raise ValueError(f"Dataset '{dataset_id}' does not exist in tenant '{tenant_id}'")
 
-        Returns:
-            List of unique dataset_ids
-        """
-        if not self.collection_exists(collection_name):
-            raise Exception(f"Collection '{collection_name}' does not exist")
+        await self.client.delete(collection_name=self.collection, points_selector=flt)
+        logger.warning("dataset deleted", tenant_id=tenant_id, dataset_id=dataset_id)
+        return existing.count
 
-        # Use scroll to get all points and extract unique dataset_ids
-        dataset_ids = set()
-        offset = None
+    # --------------------------------------------------------------
+    # Ingest
+    # --------------------------------------------------------------
+    async def add_points(
+        self,
+        tenant_id: str,
+        dataset_id: str,
+        texts: Sequence[str],
+        dense_vectors: Sequence[Sequence[float]],
+        metadata_list: Sequence[Dict[str, Any]],
+        sparse_vectors: Optional[Sequence[qm.SparseVector]] = None,
+    ) -> int:
+        if not (len(texts) == len(dense_vectors) == len(metadata_list)):
+            raise ValueError("texts, dense_vectors, metadata_list must align in length")
+        if sparse_vectors is not None and len(sparse_vectors) != len(texts):
+            raise ValueError("sparse_vectors length must match texts length")
 
-        while True:
-            # Scroll through points in batches of 100
-            scroll_result = self.client.scroll(
-                collection_name=collection_name,
-                limit=100,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False  # Don't need vectors, just payload
+        timestamp = datetime.now(timezone.utc).isoformat()
+        chunk_count = len(texts)
+
+        points: List[qm.PointStruct] = []
+        for i, (text, dense, meta) in enumerate(zip(texts, dense_vectors, metadata_list)):
+            vector: Dict[str, Any] = {"dense": list(dense)}
+            if sparse_vectors is not None:
+                vector["sparse"] = sparse_vectors[i]
+
+            payload = {
+                "tenant_id": tenant_id,
+                "dataset_id": dataset_id,
+                "chunk_index": i,
+                "chunk_count": chunk_count,
+                "text": text,
+                "created_at": timestamp,
+                **(meta or {}),
+            }
+
+            points.append(
+                qm.PointStruct(
+                    id=_point_id(tenant_id, dataset_id, i),
+                    vector=vector,
+                    payload=payload,
+                )
             )
 
-            points, next_offset = scroll_result
+        await self.client.upsert(collection_name=self.collection, points=points, wait=True)
+        logger.info(
+            "points upserted",
+            tenant_id=tenant_id,
+            dataset_id=dataset_id,
+            count=len(points),
+            hybrid=sparse_vectors is not None,
+        )
+        return len(points)
 
-            # Extract dataset_ids from payloads
-            for point in points:
-                if point.payload and "dataset_id" in point.payload:
-                    dataset_ids.add(point.payload["dataset_id"])
+    # --------------------------------------------------------------
+    # Search
+    # --------------------------------------------------------------
+    def _build_filter(
+        self,
+        tenant_id: str,
+        dataset_id: Optional[str],
+        extra: Optional[Dict[str, Any]],
+    ) -> qm.Filter:
+        must: List[qm.FieldCondition] = [
+            qm.FieldCondition(key="tenant_id", match=qm.MatchValue(value=tenant_id))
+        ]
+        if dataset_id:
+            must.append(qm.FieldCondition(key="dataset_id", match=qm.MatchValue(value=dataset_id)))
+        if extra:
+            for k, v in extra.items():
+                if v is None or v == "":
+                    continue
+                must.append(qm.FieldCondition(key=k, match=qm.MatchValue(value=v)))
+        return qm.Filter(must=must)
 
-            # Check if there are more points
-            if next_offset is None:
-                break
-            offset = next_offset
+    async def search(
+        self,
+        tenant_id: str,
+        dense_query: Sequence[float],
+        dataset_id: Optional[str] = None,
+        k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        sparse_query: Optional[qm.SparseVector] = None,
+    ) -> List[Dict[str, Any]]:
+        # Normalise placeholder values that arrive from the API layer.
+        if dataset_id is not None:
+            dataset_id = dataset_id.strip()
+            if dataset_id in {"", "string", "null"}:
+                dataset_id = None
 
-        return sorted(list(dataset_ids))
+        query_filter = self._build_filter(tenant_id, dataset_id, filters)
+        prefetch_limit = max(k * 4, 20)
 
+        if sparse_query is not None:
+            response = await self.client.query_points(
+                collection_name=self.collection,
+                prefetch=[
+                    qm.Prefetch(
+                        query=list(dense_query),
+                        using="dense",
+                        limit=prefetch_limit,
+                        filter=query_filter,
+                    ),
+                    qm.Prefetch(
+                        query=sparse_query,
+                        using="sparse",
+                        limit=prefetch_limit,
+                        filter=query_filter,
+                    ),
+                ],
+                query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+                limit=k,
+                with_payload=True,
+            )
+        else:
+            response = await self.client.query_points(
+                collection_name=self.collection,
+                query=list(dense_query),
+                using="dense",
+                query_filter=query_filter,
+                limit=k,
+                with_payload=True,
+            )
 
-# Example usage
-if __name__ == "__main__":
-    print("QdrantStore - Vector Database Wrapper")
-    print("\nExample usage:")
-    print("  store = QdrantStore()")
-    print("  store.create_collection('embeddings_768d', vector_size=768)")
-    print("  store.add_document('embeddings_768d', 'doc1', chunks, embeddings, tenant_id='company-a', metadata={'category': 'reviews'})")
-    print("  results = store.search('embeddings_768d', query_vector, tenant_id='company-a', k=10)")
-    print("\nNote: Requires Qdrant server running on localhost:6333")
+        return [self._format_hit(p) for p in response.points]
+
+    # --------------------------------------------------------------
+    # Recommend / Discover (Qdrant-unique query types)
+    # --------------------------------------------------------------
+    async def recommend(
+        self,
+        tenant_id: str,
+        positive_vectors: Sequence[Sequence[float]],
+        negative_vectors: Sequence[Sequence[float]] = (),
+        dataset_id: Optional[str] = None,
+        k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not positive_vectors and not negative_vectors:
+            raise ValueError("recommend requires at least one positive or negative example")
+
+        query_filter = self._build_filter(tenant_id, dataset_id, filters)
+        response = await self.client.query_points(
+            collection_name=self.collection,
+            query=qm.RecommendQuery(
+                recommend=qm.RecommendInput(
+                    positive=[list(v) for v in positive_vectors],
+                    negative=[list(v) for v in negative_vectors],
+                    strategy=qm.RecommendStrategy.AVERAGE_VECTOR,
+                )
+            ),
+            using="dense",
+            query_filter=query_filter,
+            limit=k,
+            with_payload=True,
+        )
+        return [self._format_hit(p) for p in response.points]
+
+    async def discover(
+        self,
+        tenant_id: str,
+        target_vector: Optional[Sequence[float]],
+        context_pairs: Sequence[tuple[Sequence[float], Sequence[float]]],
+        dataset_id: Optional[str] = None,
+        k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if target_vector is None and not context_pairs:
+            raise ValueError("discover requires target or at least one context pair")
+
+        query_filter = self._build_filter(tenant_id, dataset_id, filters)
+        context = [
+            qm.ContextPair(positive=list(pos), negative=list(neg))
+            for pos, neg in context_pairs
+        ]
+        response = await self.client.query_points(
+            collection_name=self.collection,
+            query=qm.DiscoverQuery(
+                discover=qm.DiscoverInput(
+                    target=list(target_vector) if target_vector is not None else None,
+                    context=context,
+                )
+            ),
+            using="dense",
+            query_filter=query_filter,
+            limit=k,
+            with_payload=True,
+        )
+        return [self._format_hit(p) for p in response.points]
+
+    # --------------------------------------------------------------
+    # Snapshots (admin; operates on the shared physical collection)
+    # --------------------------------------------------------------
+    async def create_snapshot(self) -> Dict[str, Any]:
+        desc = await self.client.create_snapshot(collection_name=self.collection)
+        return {
+            "name": desc.name,
+            "creation_time": getattr(desc, "creation_time", None),
+            "size": getattr(desc, "size", None),
+        }
+
+    async def list_snapshots(self) -> List[Dict[str, Any]]:
+        descs = await self.client.list_snapshots(collection_name=self.collection)
+        return [
+            {
+                "name": d.name,
+                "creation_time": getattr(d, "creation_time", None),
+                "size": getattr(d, "size", None),
+            }
+            for d in descs
+        ]
+
+    @staticmethod
+    def _format_hit(point: Any) -> Dict[str, Any]:
+        payload = point.payload or {}
+        core = {
+            "dataset_id": payload.get("dataset_id"),
+            "chunk_index": payload.get("chunk_index"),
+            "chunk_count": payload.get("chunk_count"),
+            "created_at": payload.get("created_at"),
+        }
+        extras = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"text", "chunk_index", "chunk_count", "dataset_id", "created_at", "tenant_id"}
+        }
+        return {
+            "score": float(point.score) if point.score is not None else 0.0,
+            "text": payload.get("text", ""),
+            "metadata": {**core, **extras},
+        }

@@ -1,10 +1,11 @@
 """
-Embedding Service
+RAGmodel
 
-A production-grade embedding service using Gemini and Qdrant.
+Production-grade multi-tenant RAG service on Qdrant with local open-source
+embeddings, hybrid search, and native observability.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 # Export main components for easier imports
 try:

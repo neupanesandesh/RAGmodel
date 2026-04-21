@@ -1,84 +1,105 @@
 """
-Configuration Management
+Typed configuration loaded from environment / .env.
 
-Handles environment variables and application settings.
+All settings flow through a single `Settings` instance. Validation is strict:
+bad production config fails fast at startup rather than at first request.
 """
 
-import os
-from typing import Optional
-from pydantic_settings import BaseSettings
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
+from typing import List, Optional
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
-    # Gemini Configuration
-    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "models/gemini-embedding-001")
-    embedding_dimension: int = int(os.getenv("EMBEDDING_DIMENSION", "768"))
+    # -------- Embedder --------
+    embedder_backend: str = Field(default="sentence-transformers")
+    embedder_model: str = Field(default="BAAI/bge-small-en-v1.5")
+    embedding_dimension: int = Field(default=384, ge=64, le=4096)
+    embedder_device: Optional[str] = Field(default=None)
 
-    # Qdrant Configuration
-    qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
-    qdrant_api_key: Optional[str] = os.getenv("QDRANT_API_KEY", None)
+    # -------- Qdrant --------
+    qdrant_url: str = Field(default="http://localhost:6333")
+    qdrant_api_key: Optional[str] = Field(default=None)
+    qdrant_timeout: int = Field(default=30, ge=1, le=600)
+    qdrant_collection: str = Field(default="ragmodel")
+    hybrid_search_enabled: bool = Field(default=True)
+    sparse_model: str = Field(default="Qdrant/bm25")
 
-    # Service Configuration
-    service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
-    service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
+    # -------- Service --------
+    service_host: str = Field(default="0.0.0.0")
+    service_port: int = Field(default=8000, ge=1, le=65535)
+    cors_origins: str = Field(default="http://localhost:3000,http://localhost:8000")
+    api_key: str = Field(default="")
+    admin_api_key: str = Field(default="")
+    rate_limit: str = Field(default="60/minute")
 
-    # Logging Configuration
-    environment: str = os.getenv("ENVIRONMENT", "development")
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
-    log_dir: str = os.getenv("LOG_DIR", "./logs")
-    log_retention_days: int = int(os.getenv("LOG_RETENTION_DAYS", "30"))
-    log_rotation_size: str = os.getenv("LOG_ROTATION_SIZE", "100 MB")
+    # -------- Observability --------
+    environment: str = Field(default="development")
+    log_level: str = Field(default="INFO")
+    metrics_enabled: bool = Field(default=True)
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    @field_validator("embedder_backend")
+    @classmethod
+    def _validate_backend(cls, v: str) -> str:
+        allowed = {"sentence-transformers", "fastembed"}
+        v = v.strip().lower()
+        if v not in allowed:
+            raise ValueError(f"embedder_backend must be one of {allowed}, got {v!r}")
+        return v
+
+    @field_validator("environment")
+    @classmethod
+    def _validate_env(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"development", "staging", "production"}:
+            raise ValueError("environment must be development|staging|production")
+        return v
+
+    @field_validator("log_level")
+    @classmethod
+    def _validate_level(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in {"TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("invalid log_level")
+        return v
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
 
 
-# Global settings instance
 settings = Settings()
 
 
-def validate_settings():
+def validate_settings() -> None:
+    """Raise if settings are unsafe for the selected environment."""
+    errors: List[str] = []
 
-    errors = []
-
-    # Check Gemini API key (warn but don't block startup)
-    if not settings.gemini_api_key:
-        import logging
-        logging.warning("GEMINI_API_KEY is not set - embedding features will be unavailable")
-
-    # Check embedding dimension is valid
-    valid_dimensions = [768, 1536, 3072]
-    if settings.embedding_dimension not in valid_dimensions:
-        errors.append(
-            f"EMBEDDING_DIMENSION must be one of {valid_dimensions}, "
-            f"got {settings.embedding_dimension}"
-        )
-
-    # Check Qdrant URL is set
     if not settings.qdrant_url:
-        errors.append("QDRANT_URL is required but not set")
+        errors.append("QDRANT_URL is required")
+
+    if settings.is_production:
+        if not settings.api_key or settings.api_key == "change-me-in-production":
+            errors.append("API_KEY must be set to a real value in production")
+        if "*" in settings.cors_origins_list:
+            errors.append("CORS_ORIGINS must not be '*' in production")
 
     if errors:
         raise ValueError(
-            "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+            "Configuration invalid:\n" + "\n".join(f"  - {e}" for e in errors)
         )
 
 
 def get_settings() -> Settings:
-    """
-    Get the global settings instance.
-
-    Returns:
-        Settings instance
-    """
     return settings
-
-
-

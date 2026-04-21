@@ -85,10 +85,12 @@ class EmbeddingClient:
         ... )
     """
     
-    def __init__(self, service_url: str, timeout: int = 30):
+    def __init__(self, service_url: str, timeout: int = 30, api_key: Optional[str] = None):
         self.base_url = service_url.rstrip('/')
         self.timeout = timeout
         self.session = requests.Session()
+        if api_key:
+            self.session.headers["X-API-Key"] = api_key
     
     def _make_request(
         self,

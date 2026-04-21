@@ -1,366 +1,223 @@
-from typing import List, Tuple
-import numpy as np
-import time
-import random
-from google import genai
-from google.genai import types
+"""
+Embedding backends.
+
+Only open-source, locally-running models are supported. No external API keys
+are required to operate the service — a fresh clone + `docker compose up` is
+enough to produce embeddings.
+
+The active backend is controlled by `EMBEDDER_BACKEND` in config:
+- "sentence-transformers" (default): HuggingFace sentence-transformers
+- "fastembed": Qdrant's FastEmbed (ONNX runtime, smaller image footprint)
+
+Both implement the `Embedder` Protocol below so the rest of the service
+doesn't care which one is in use.
+"""
+
+from typing import List, Optional, Protocol, runtime_checkable
 from enum import Enum
-from requests.exceptions import ConnectionError, Timeout
+
+import numpy as np
+
 from service.logging_config import get_component_logger
 
-# Initialize logger for embedder module
 logger = get_component_logger("embedder")
 
+
 class TaskType(str, Enum):
+    """Retained for backwards compatibility with earlier API callers."""
     RETRIEVAL_DOCUMENT = "RETRIEVAL_DOCUMENT"
     RETRIEVAL_QUERY = "RETRIEVAL_QUERY"
 
 
-class GeminiEmbedder:
-    
-    def __init__(
-        self,
-        api_key: str = None,
-        model: str ="gemini-embedding-001",
-        dimensions: int = 768
-    ):
-        self.model = model
-        self.dimensions = dimensions
+# BGE models expect a query-side instruction prefix for asymmetric retrieval.
+# Document side is passed as-is. See https://huggingface.co/BAAI/bge-small-en-v1.5
+_BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
-        if api_key:
-            self.client = genai.Client(api_key=api_key)
-        else:
-            self.client = genai.Client()
 
-        logger.debug(
-            "GeminiEmbedder initialized",
-            extra={"model": self.model, "dimensions": self.dimensions}
-        )
-            
+@runtime_checkable
+class Embedder(Protocol):
+    """Minimal contract implemented by every embedder backend."""
 
-    def _normalize_embedding(self, embedding: List[float]) -> List[float]:
-        """
-        Normalize an embedding vector to unit length.
-        Required for 768 and 1536 dimensions (3072 comes pre-normalized).
-        
-        Normalization ensures we measure angular similarity (direction)
-        rather than magnitude, which is correct for semantic comparison.
-        
-        Args:
-            embedding: Raw embedding vector
-            
-        Returns:
-            Normalized embedding vector
-        """
-        embedding_array = np.array(embedding)
-        norm = np.linalg.norm(embedding_array)
-        
-        if norm == 0:
-            return embedding  # Avoid division by zero
-        
-        normalized = embedding_array / norm
-        return normalized.tolist()
-
-    def embed_single(
-        self,
-        text: str,
-        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT
-    ) -> List[float]:
-        """
-        Generate embedding for a single text.
-
-        Args:
-            text: Text to embed
-            task_type: Either "RETRIEVAL_DOCUMENT" (for indexing) or
-                        "RETRIEVAL_QUERY" (for search queries)
-
-        Returns:
-            Normalized embedding vector
-
-        Raises:
-            ValueError: If text is empty or too long
-            Exception: If API call fails
-        """
-        if not text or not text.strip():
-            raise ValueError("Text cannot be empty")
-
-        try:
-            logger.debug(
-                f"Generating single embedding (task_type={task_type})",
-                extra={"text_length": len(text), "task_type": task_type}
-            )
-
-            result = self.client.models.embed_content(
-                model=self.model,
-                contents=text,
-                config=types.EmbedContentConfig(
-                    task_type=task_type,
-                    output_dimensionality=self.dimensions
-                )
-            )
-
-            # Extract embedding values
-            embedding = result.embeddings[0].values
-
-            # Normalize if not using 3072 dimensions
-            embedding = self._normalize_embedding(embedding)
-
-            logger.debug(
-                "Single embedding generated successfully",
-                extra={"vector_dimension": len(embedding)}
-            )
-
-            return embedding
-
-        except Exception as e:
-            logger.error(
-                f"Failed to generate single embedding: {str(e)}",
-                extra={"text_length": len(text), "task_type": task_type}
-            )
-            raise Exception(f"Failed to generate embedding: {str(e)}")
-
-    def _embed_batch_with_retry(
-        self,
-        batch: List[str],
-        task_type: TaskType,
-        batch_num: int,
-        num_batches: int,
-        max_retries: int = 3
-    ) -> List[List[float]]:
-        """
-        Embed a batch with retry logic and exponential backoff.
-
-        Args:
-            batch: List of texts to embed
-            task_type: Type of embedding task
-            batch_num: Current batch number
-            num_batches: Total number of batches
-            max_retries: Maximum number of retry attempts (default: 3)
-
-        Returns:
-            List of embedding vectors
-
-        Raises:
-            Exception: If all retries fail
-        """
-        for attempt in range(max_retries + 1):
-            try:
-                # Call Gemini API for this batch
-                result = self.client.models.embed_content(
-                    model=self.model,
-                    contents=batch,
-                    config=types.EmbedContentConfig(
-                        task_type=task_type,
-                        output_dimensionality=self.dimensions
-                    )
-                )
-
-                # Extract and normalize embeddings from this batch
-                batch_embeddings = []
-                for emb in result.embeddings:
-                    embedding = emb.values
-                    embedding = self._normalize_embedding(embedding)
-                    batch_embeddings.append(embedding)
-
-                return batch_embeddings
-
-            except (ConnectionError, Timeout) as e:
-                # Network errors - retry with exponential backoff
-                if attempt < max_retries:
-                    # Exponential backoff: 1s, 2s, 4s
-                    delay = (2 ** attempt) + random.uniform(0, 1)  # Add jitter
-                    logger.warning(
-                        f"Batch {batch_num}/{num_batches} failed (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s...",
-                        extra={
-                            "batch_num": batch_num,
-                            "attempt": attempt + 1,
-                            "error": str(e),
-                            "retry_delay": delay
-                        }
-                    )
-                    time.sleep(delay)
-                else:
-                    logger.error(
-                        f"Batch {batch_num}/{num_batches} failed after {max_retries} retries",
-                        extra={"batch_num": batch_num, "error": str(e)}
-                    )
-                    raise Exception(f"Batch {batch_num} failed after {max_retries} retries: {str(e)}")
-
-            except Exception as e:
-                # Check if it's a retryable error (rate limit, server error)
-                error_str = str(e).lower()
-                is_retryable = any(x in error_str for x in ["429", "rate limit", "500", "503", "timeout", "connection"])
-
-                if is_retryable and attempt < max_retries:
-                    delay = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(
-                        f"Batch {batch_num}/{num_batches} hit retryable error (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s...",
-                        extra={
-                            "batch_num": batch_num,
-                            "attempt": attempt + 1,
-                            "error": str(e),
-                            "retry_delay": delay
-                        }
-                    )
-                    time.sleep(delay)
-                else:
-                    # Non-retryable error or max retries exceeded
-                    logger.error(
-                        f"Batch {batch_num}/{num_batches} failed with non-retryable error or max retries exceeded",
-                        extra={"batch_num": batch_num, "error": str(e), "is_retryable": is_retryable}
-                    )
-                    raise Exception(f"Batch {batch_num} failed: {str(e)}")
+    dimensions: int
+    model_name: str
 
     def embed_batch(
         self,
         texts: List[str],
-        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT
+        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT,
+    ) -> List[List[float]]: ...
+
+    def embed_single(
+        self,
+        text: str,
+        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT,
+    ) -> List[float]: ...
+
+    def embed_for_indexing(self, text: str) -> List[float]: ...
+
+    def embed_for_search(self, query: str) -> List[float]: ...
+
+
+def _normalize(vec: np.ndarray) -> np.ndarray:
+    """L2-normalize a vector. Required for cosine similarity on Qdrant."""
+    norm = np.linalg.norm(vec)
+    if norm == 0:
+        return vec
+    return vec / norm
+
+
+class SentenceTransformerEmbedder:
+    """BGE / MiniLM / etc. via the sentence-transformers library."""
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-small-en-v1.5",
+        device: Optional[str] = None,
+        expected_dimension: Optional[int] = None,
+    ):
+        from sentence_transformers import SentenceTransformer
+
+        self.model_name = model_name
+        self._model = SentenceTransformer(model_name, device=device or None)
+        self.dimensions = int(self._model.get_sentence_embedding_dimension())
+
+        if expected_dimension and expected_dimension != self.dimensions:
+            raise ValueError(
+                f"Model {model_name} produces {self.dimensions}-dim vectors, "
+                f"but EMBEDDING_DIMENSION={expected_dimension}. Fix the config."
+            )
+
+        self._is_bge = "bge" in model_name.lower()
+
+        logger.info(
+            "SentenceTransformerEmbedder ready",
+            model=model_name,
+            dimensions=self.dimensions,
+            device=device or "auto",
+        )
+
+    def _prep(self, text: str, task_type: TaskType) -> str:
+        if self._is_bge and task_type == TaskType.RETRIEVAL_QUERY:
+            return _BGE_QUERY_INSTRUCTION + text
+        return text
+
+    def embed_batch(
+        self,
+        texts: List[str],
+        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT,
     ) -> List[List[float]]:
-        """
-        Generate embeddings for multiple texts with automatic batching.
-
-        Handles large document chunking by splitting into sub-batches of 50 texts
-        to stay within Gemini API limits (max 100 texts per request).
-
-        Args:
-            texts: List of texts to embed
-            task_type: Either "RETRIEVAL_DOCUMENT" or "RETRIEVAL_QUERY"
-
-        Returns:
-            List of normalized embedding vectors
-
-        Raises:
-            ValueError: If texts list is empty
-            Exception: If API call fails
-        """
-        # Reduced from 50 to 20 for better reliability with large documents
-        # Smaller batches = less likely to timeout, easier to retry
-        MAX_BATCH_SIZE = 20
-
         if not texts:
             raise ValueError("Texts list cannot be empty")
 
-        # Filter out empty texts
-        valid_texts = [t for t in texts if t and t.strip()]
-        if not valid_texts:
+        valid = [t for t in texts if t and t.strip()]
+        if not valid:
             raise ValueError("All texts are empty")
 
-        try:
-            total_texts = len(valid_texts)
-            num_batches = (total_texts + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
+        prepped = [self._prep(t, task_type) for t in valid]
+        arr = self._model.encode(
+            prepped,
+            batch_size=32,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return [v.astype(np.float32).tolist() for v in arr]
 
-            logger.info(
-                f"Generating batch embeddings for {total_texts} texts in {num_batches} batch(es)",
-                extra={
-                    "batch_size": total_texts,
-                    "sub_batches": num_batches,
-                    "task_type": task_type,
-                    "total_chars": sum(len(t) for t in valid_texts)
-                }
-            )
-
-            all_embeddings = []
-
-            # Process in sub-batches
-            for i in range(0, total_texts, MAX_BATCH_SIZE):
-                batch = valid_texts[i:i + MAX_BATCH_SIZE]
-                batch_num = (i // MAX_BATCH_SIZE) + 1
-
-                logger.debug(
-                    f"Processing sub-batch {batch_num}/{num_batches} ({len(batch)} texts)",
-                    extra={"batch_num": batch_num, "batch_size": len(batch)}
-                )
-
-                # Call Gemini API with retry logic
-                batch_embeddings = self._embed_batch_with_retry(
-                    batch=batch,
-                    task_type=task_type,
-                    batch_num=batch_num,
-                    num_batches=num_batches
-                )
-
-                all_embeddings.extend(batch_embeddings)
-
-                logger.debug(
-                    f"Sub-batch {batch_num}/{num_batches} completed",
-                    extra={"embeddings_generated": len(batch_embeddings)}
-                )
-
-                # Add small delay between batches to avoid rate limiting (except for last batch)
-                if i + MAX_BATCH_SIZE < total_texts:
-                    time.sleep(2)
-
-            logger.success(
-                f"Batch embeddings generated successfully: {len(all_embeddings)} vectors",
-                extra={
-                    "embeddings_count": len(all_embeddings),
-                    "dimension": self.dimensions,
-                    "sub_batches": num_batches
-                }
-            )
-
-            return all_embeddings
-
-        except Exception as e:
-            logger.error(
-                f"Failed to generate batch embeddings: {str(e)}",
-                extra={"batch_size": len(valid_texts), "task_type": task_type}
-            )
-            raise Exception(f"Failed to generate batch embeddings: {str(e)}")
+    def embed_single(
+        self,
+        text: str,
+        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT,
+    ) -> List[float]:
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+        return self.embed_batch([text], task_type=task_type)[0]
 
     def embed_for_indexing(self, text: str) -> List[float]:
-        """
-        Convenience method: Embed text for indexing (storage).
-        Uses RETRIEVAL_DOCUMENT task type.
-
-        Args:
-            text: Document text to embed
-
-        Returns:
-            Normalized embedding vector
-        """
         return self.embed_single(text, task_type=TaskType.RETRIEVAL_DOCUMENT)
 
     def embed_for_search(self, query: str) -> List[float]:
-        """
-        Convenience method: Embed query for searching.
-        Uses RETRIEVAL_QUERY task type.
-
-        Args:
-            query: Search query text
-
-        Returns:
-            Normalized embedding vector
-        """
         return self.embed_single(query, task_type=TaskType.RETRIEVAL_QUERY)
 
-# if __name__ == "__main__":
-#     import os
-    
-#     # Check if API key is available
-#     if not os.getenv("GEMINI_API_KEY"):
-#         print("Set GEMINI_API_KEY environment variable to test")
-#         print("\nExample usage:")
-#         print("  embedder = GeminiEmbedder()")
-#         print("  vector = embedder.embed_for_indexing('Your text here')")
-#         print("  print(f'Vector dimension: {len(vector)}')")
-#     else:
-#         # Test with actual API
-#         embedder = GeminiEmbedder()
-        
-#         # Test single embedding
-#         text = "What is the meaning of life?"
-#         embedding = embedder.embed_for_search(text)
-#         print(f"Single embedding dimension: {len(embedding)}")
-#         print(f"Normalized (should be ~1.0): {np.linalg.norm(embedding):.6f}")
-        
-#         # Test batch embedding
-#         texts = [
-#             "What is the meaning of life?",
-#             "How do I bake a cake?",
-#             "What is machine learning?"
-#         ]
-#         embeddings = embedder.embed_batch(texts)
-#         print(f"\nBatch embeddings count: {len(embeddings)}")
-#         for i, emb in enumerate(embeddings):
-#             print(f"  Embedding {i}: {len(emb)} dimensions, norm: {np.linalg.norm(emb):.6f}")
+
+class FastEmbedEmbedder:
+    """ONNX-based embedder from Qdrant's FastEmbed. Smaller image, no torch."""
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-small-en-v1.5",
+        expected_dimension: Optional[int] = None,
+    ):
+        from fastembed import TextEmbedding
+
+        self.model_name = model_name
+        self._model = TextEmbedding(model_name=model_name)
+
+        probe = next(iter(self._model.embed(["probe"])))
+        self.dimensions = len(probe)
+
+        if expected_dimension and expected_dimension != self.dimensions:
+            raise ValueError(
+                f"Model {model_name} produces {self.dimensions}-dim vectors, "
+                f"but EMBEDDING_DIMENSION={expected_dimension}. Fix the config."
+            )
+
+        logger.info(
+            "FastEmbedEmbedder ready",
+            model=model_name,
+            dimensions=self.dimensions,
+        )
+
+    def embed_batch(
+        self,
+        texts: List[str],
+        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT,
+    ) -> List[List[float]]:
+        if not texts:
+            raise ValueError("Texts list cannot be empty")
+        valid = [t for t in texts if t and t.strip()]
+        if not valid:
+            raise ValueError("All texts are empty")
+
+        out: List[List[float]] = []
+        for vec in self._model.embed(valid):
+            arr = np.asarray(vec, dtype=np.float32)
+            arr = _normalize(arr)
+            out.append(arr.tolist())
+        return out
+
+    def embed_single(
+        self,
+        text: str,
+        task_type: TaskType = TaskType.RETRIEVAL_DOCUMENT,
+    ) -> List[float]:
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+        return self.embed_batch([text], task_type=task_type)[0]
+
+    def embed_for_indexing(self, text: str) -> List[float]:
+        return self.embed_single(text, task_type=TaskType.RETRIEVAL_DOCUMENT)
+
+    def embed_for_search(self, query: str) -> List[float]:
+        return self.embed_single(query, task_type=TaskType.RETRIEVAL_QUERY)
+
+
+def build_embedder(
+    backend: str,
+    model_name: str,
+    expected_dimension: int,
+    device: Optional[str] = None,
+) -> Embedder:
+    """Factory: pick a backend by name."""
+    backend = backend.lower()
+    if backend == "sentence-transformers":
+        return SentenceTransformerEmbedder(
+            model_name=model_name,
+            device=device,
+            expected_dimension=expected_dimension,
+        )
+    if backend == "fastembed":
+        return FastEmbedEmbedder(
+            model_name=model_name,
+            expected_dimension=expected_dimension,
+        )
+    raise ValueError(f"Unknown embedder backend: {backend!r}")

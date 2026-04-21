@@ -98,6 +98,54 @@ class SearchResponse(BaseModel):
     count: int
 
 
+# Recommend / Discover Models
+class RecommendRequest(BaseModel):
+    """Recommend similar content by positive and negative examples."""
+    positive_texts: List[str] = Field(
+        default_factory=list,
+        description="Texts describing what you want more of",
+    )
+    negative_texts: List[str] = Field(
+        default_factory=list,
+        description="Texts describing what you want less of",
+    )
+    filters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional metadata filters",
+    )
+
+
+class ContextPair(BaseModel):
+    """A single (positive, negative) steering pair for Discover."""
+    positive: str = Field(..., min_length=1)
+    negative: str = Field(..., min_length=1)
+
+
+class DiscoverRequest(BaseModel):
+    """Discover points near a target while respecting steering pairs."""
+    target: Optional[str] = Field(
+        default=None,
+        description="Text describing what to find. If omitted, discovery uses context alone.",
+    )
+    context: List[ContextPair] = Field(
+        default_factory=list,
+        description="Pairs of (positive, negative) that bias the search region",
+    )
+    filters: Optional[Dict[str, Any]] = Field(default=None)
+
+
+# Snapshot Models
+class SnapshotInfo(BaseModel):
+    """Metadata about a single Qdrant snapshot."""
+    name: str
+    creation_time: Optional[str] = None
+    size: Optional[int] = None
+
+
+class SnapshotListResponse(BaseModel):
+    snapshots: List[SnapshotInfo]
+
+
 # Error Models
 class ErrorResponse(BaseModel):
     """Standard error response."""
@@ -109,9 +157,11 @@ class ErrorResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str
-    gemini_configured: bool
     qdrant_configured: bool
-    version: str = "1.0.0"
+    embedder_ready: bool
+    embedder_model: Optional[str] = None
+    embedder_dimensions: Optional[int] = None
+    version: str = "2.0.0"
 
 
 # 

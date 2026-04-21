@@ -114,19 +114,6 @@ def chunk_text(text: str) -> List[Tuple[str, int]]:
             extra={"chunks_count": len(result), "strategy": "sliding_window"}
         )
         return result
-    
-# def validate_chunk_size(text: str, max_tokens: int = 2048) -> bool:
-#     """
-#     Validate that a text chunk is within Gemini's token limit.
-    
-#     Args:
-#         text: Text chunk to validate
-#         max_tokens: Maximum allowed tokens (default: 2048 for Gemini)
-        
-#     Returns:
-#         True if chunk is valid, False otherwise
-#     """
-#     return estimate_tokens(text) <= max_tokens
 
 
 # if __name__ == "__main__":
