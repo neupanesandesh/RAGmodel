@@ -196,6 +196,32 @@ footer a{color:var(--accent2);text-decoration:none}
 
 <script>
 const API = '';
+const API_KEY_STORAGE = 'ragmodel_api_key';
+
+function getApiKey() {
+  let k = localStorage.getItem(API_KEY_STORAGE);
+  if (!k) {
+    k = prompt('Enter your API key (X-API-Key header).\nFind it in your server .env as API_KEY.');
+    if (k) localStorage.setItem(API_KEY_STORAGE, k.trim());
+  }
+  return k ? k.trim() : '';
+}
+
+function clearApiKey() {
+  localStorage.removeItem(API_KEY_STORAGE);
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  const key = getApiKey();
+  if (key) headers['X-API-Key'] = key;
+  const r = await fetch(API + path, Object.assign({}, opts, {headers}));
+  if (r.status === 401) {
+    clearApiKey();
+    alert('API key rejected. Refresh to enter a new one.');
+  }
+  return r;
+}
 
 // Tabs
 document.querySelectorAll('.tab').forEach(t => {
@@ -219,7 +245,7 @@ function hideStatus(id) {
   document.getElementById(id).className = 'status-msg';
 }
 
-// Health check
+// Health check — no auth required
 async function checkHealth() {
   try {
     const r = await fetch(API + '/health');
@@ -236,7 +262,7 @@ async function checkHealth() {
 async function loadCollections() {
   const container = document.getElementById('collectionsList');
   try {
-    const r = await fetch(API + '/collections');
+    const r = await api('/collections');
     const d = await r.json();
     if (!d.collections || d.collections.length === 0) {
       container.innerHTML = '<div class="empty-state">No collections yet. Create one above.</div>';
@@ -246,7 +272,7 @@ async function loadCollections() {
     for (const name of d.collections) {
       let meta = '';
       try {
-        const ir = await fetch(API + '/collections/' + encodeURIComponent(name));
+        const ir = await api('/collections/' + encodeURIComponent(name));
         const info = await ir.json();
         meta = info.vector_count + ' vectors, dim=' + info.vector_size;
       } catch { meta = ''; }
@@ -269,7 +295,7 @@ async function createCollection() {
   if (!name) return showStatus('createStatus', 'Please enter a name.', false);
   hideStatus('createStatus');
   try {
-    const r = await fetch(API + '/collections', {
+    const r = await api('/collections', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name})
     });
@@ -286,7 +312,7 @@ async function createCollection() {
 async function deleteCollection(name) {
   if (!confirm('Delete collection "' + name + '" and all its data?')) return;
   try {
-    const r = await fetch(API + '/collections/' + encodeURIComponent(name), {method: 'DELETE'});
+    const r = await api('/collections/' + encodeURIComponent(name), {method: 'DELETE'});
     if (!r.ok) { const d = await r.json(); throw new Error(d.detail || 'Failed'); }
     loadCollections();
   } catch (e) {
@@ -296,7 +322,7 @@ async function deleteCollection(name) {
 
 async function viewDatasets(name) {
   try {
-    const r = await fetch(API + '/collections/' + encodeURIComponent(name) + '/datasets');
+    const r = await api('/collections/' + encodeURIComponent(name) + '/datasets');
     const d = await r.json();
     alert('Datasets in "' + name + '" (' + d.count + '):\n\n' + (d.datasets.length ? d.datasets.join('\n') : '(none)'));
   } catch (e) {
@@ -307,7 +333,7 @@ async function viewDatasets(name) {
 // Refresh collection selects
 async function refreshCollSelects() {
   try {
-    const r = await fetch(API + '/collections');
+    const r = await api('/collections');
     const d = await r.json();
     ['uploadColl', 'searchColl'].forEach(id => {
       const sel = document.getElementById(id);
@@ -336,7 +362,7 @@ async function uploadDocuments() {
 
   showStatus('uploadStatus', 'Uploading ' + docs.length + ' documents...', true);
   try {
-    const r = await fetch(API + '/collections/' + encodeURIComponent(coll) + '/documents/batch/' + encodeURIComponent(dsId), {
+    const r = await api('/collections/' + encodeURIComponent(coll) + '/documents/batch/' + encodeURIComponent(dsId), {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({documents: docs})
     });
@@ -381,7 +407,7 @@ async function doSearch() {
   if (filters) body.filters = filters;
 
   try {
-    const r = await fetch(url, {
+    const r = await api(url, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
     });
