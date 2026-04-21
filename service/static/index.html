@@ -115,7 +115,8 @@ footer a{color:var(--accent2);text-decoration:none}
       <div class="form-row">
         <div class="form-group">
           <label>Collection</label>
-          <select id="uploadColl"></select>
+          <input type="text" id="uploadColl" list="uploadCollList" placeholder="e.g. acme">
+          <datalist id="uploadCollList"></datalist>
         </div>
         <div class="form-group">
           <label>Dataset ID</label>
@@ -145,7 +146,8 @@ footer a{color:var(--accent2);text-decoration:none}
       <div class="form-row">
         <div class="form-group">
           <label>Collection</label>
-          <select id="searchColl"></select>
+          <input type="text" id="searchColl" list="searchCollList" placeholder="e.g. acme">
+          <datalist id="searchCollList"></datalist>
         </div>
         <div class="form-group">
           <label>Dataset ID (optional)</label>
@@ -330,16 +332,14 @@ async function viewDatasets(name) {
   }
 }
 
-// Refresh collection selects
+// Refresh collection datalists (autocomplete suggestions)
 async function refreshCollSelects() {
   try {
     const r = await api('/collections');
     const d = await r.json();
-    ['uploadColl', 'searchColl'].forEach(id => {
-      const sel = document.getElementById(id);
-      const prev = sel.value;
-      sel.innerHTML = d.collections.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
-      if (prev && d.collections.includes(prev)) sel.value = prev;
+    ['uploadCollList', 'searchCollList'].forEach(id => {
+      const dl = document.getElementById(id);
+      dl.innerHTML = (d.collections || []).map(c => `<option value="${esc(c)}">`).join('');
     });
   } catch {}
 }
