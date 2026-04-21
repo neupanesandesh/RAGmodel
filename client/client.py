@@ -119,7 +119,7 @@ class EmbeddingClient:
             # Extract error message from response if available
             try:
                 error_detail = e.response.json().get("detail", str(e))
-            except:
+            except Exception:
                 error_detail = str(e)
             raise Exception(f"API Error: {error_detail}")
             

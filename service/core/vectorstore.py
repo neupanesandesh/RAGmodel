@@ -25,7 +25,7 @@ Design notes
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import uuid
 
@@ -57,12 +57,15 @@ class QdrantStore:
     ):
         self.collection = collection
         self.dense_dim = dense_dim
-        self.client = AsyncQdrantClient(
-            url=url,
-            api_key=api_key,
-            timeout=timeout,
-            prefer_grpc=False,
-        )
+        if url == ":memory:":
+            self.client = AsyncQdrantClient(location=":memory:")
+        else:
+            self.client = AsyncQdrantClient(
+                url=url,
+                api_key=api_key,
+                timeout=timeout,
+                prefer_grpc=False,
+            )
         logger.info(
             "QdrantStore initialised",
             url=url,

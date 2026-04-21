@@ -4,7 +4,6 @@ Tests for text chunking logic.
 Critical because chunking affects search quality.
 """
 
-import pytest
 from service.core.chunking import chunk_text, estimate_tokens
 
 

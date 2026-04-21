@@ -9,6 +9,14 @@ from service.config import Settings, validate_settings
 
 class TestSettings:
     def test_defaults(self, monkeypatch):
+        # Clear env vars that might be set by CI / a .env file so we're
+        # actually testing field defaults.
+        for var in (
+            "ENVIRONMENT", "EMBEDDER_BACKEND", "EMBEDDER_MODEL",
+            "EMBEDDING_DIMENSION", "QDRANT_URL", "QDRANT_COLLECTION",
+            "HYBRID_SEARCH_ENABLED",
+        ):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("ENVIRONMENT", "development")
         s = Settings()
         assert s.embedder_backend == "sentence-transformers"
